@@ -6,10 +6,8 @@ import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
-import { resolve, dirname, join } from 'path';
+import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { homedir } from 'os';
-import { DatabaseSync } from 'node:sqlite';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -45,6 +43,9 @@ function loadConfig() {
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
+  if (process.env.CC_API_KEY || process.env.COMMAND_CODE_API_KEY) {
+    defaults.apiKey = (process.env.CC_API_KEY || process.env.COMMAND_CODE_API_KEY).trim();
+  }
 
   return defaults;
 }
@@ -836,20 +837,8 @@ function sendJSON(res, status, data) {
 
 function getFallbackApiKey() {
   if (CFG.apiKey) return CFG.apiKey;
-  if (process.env.COMMAND_CODE_API_KEY) return process.env.COMMAND_CODE_API_KEY;
-  if (process.env.CC_API_KEY) return process.env.CC_API_KEY;
-  try {
-    const dbPath = join(homedir(), '.omp', 'agent', 'agent.db');
-    if (existsSync(dbPath)) {
-      const db = new DatabaseSync(dbPath, { readOnly: true });
-      const row = db.prepare("SELECT data FROM auth_credentials WHERE provider='command-code' AND disabled_cause IS NULL ORDER BY id ASC LIMIT 1").get();
-      db.close();
-      if (row?.data) {
-        const parsed = JSON.parse(row.data);
-        if (parsed?.key) return parsed.key;
-      }
-    }
-  } catch {}
+  if (process.env.CC_API_KEY) return process.env.CC_API_KEY.trim();
+  if (process.env.COMMAND_CODE_API_KEY) return process.env.COMMAND_CODE_API_KEY.trim();
   return null;
 }
 
