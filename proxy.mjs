@@ -6,8 +6,10 @@ import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
-import { resolve, dirname } from 'path';
+import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { homedir } from 'os';
+import { DatabaseSync } from 'node:sqlite';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -679,14 +681,37 @@ const CC_STATUS_MAP = {
 function mapCcError(ccStatus, ccBody) {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
   let message = `CC API error (${ccStatus})`;
+  let rawType = null;
+  let rawCode = null;
 
   if (ccBody) {
     try {
       const parsed = JSON.parse(ccBody);
       message = parsed.error?.message || parsed.message || message;
+      rawType = parsed.error?.type || parsed.type || null;
+      rawCode = parsed.error?.code || parsed.code || null;
     } catch {
       message = ccBody.slice(0, 200) || message;
     }
+  }
+
+  // Quota / balance / rate limits -> HTTP 429 insufficient_quota for OMP credential rotation
+  const isQuota = /insufficient\s+(?:credits|balance)|weekly usage limit|usage_limit_reached|quota\s+(?:exceeded|reached)|free.?usage.?limit|go.?usage.?limit/i.test(message)
+    || rawCode === 'insufficient_quota'
+    || rawType === 'insufficient_quota';
+
+  if (isQuota) {
+    return {
+      status: 429,
+      body: {
+        error: {
+          message,
+          type: 'insufficient_quota',
+          code: 'insufficient_quota',
+        },
+        retry_after: 0,
+      },
+    };
   }
 
   // CC 429 响应可能带 retry-after
@@ -734,6 +759,25 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+function getFallbackApiKey() {
+  if (CFG.apiKey) return CFG.apiKey;
+  if (process.env.COMMAND_CODE_API_KEY) return process.env.COMMAND_CODE_API_KEY;
+  if (process.env.CC_API_KEY) return process.env.CC_API_KEY;
+  try {
+    const dbPath = join(homedir(), '.omp', 'agent', 'agent.db');
+    if (existsSync(dbPath)) {
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      const row = db.prepare("SELECT data FROM auth_credentials WHERE provider='command-code' AND disabled_cause IS NULL ORDER BY id ASC LIMIT 1").get();
+      db.close();
+      if (row?.data) {
+        const parsed = JSON.parse(row.data);
+        if (parsed?.key) return parsed.key;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 function getApiKey(headers) {
   // Try Authorization: Bearer header (OpenAI SDK style)
   const auth = headers['authorization'] || headers['Authorization'] || '';
@@ -747,7 +791,7 @@ function getApiKey(headers) {
     const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
     if (match) return match[0];
   }
-  return null;
+  return getFallbackApiKey();
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -1830,12 +1874,14 @@ async function fetchModels(apiKey) {
     return dynamicModels;
   }
 
+  const resolvedKey = apiKey || getFallbackApiKey();
+
   try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+    if (!resolvedKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
     const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        'Authorization': `Bearer ${resolvedKey}`,
         'x-cli-environment': 'production',
         'x-command-code-version': CC_VERSION,
       },
@@ -1847,20 +1893,21 @@ async function fetchModels(apiKey) {
       if (Array.isArray(data.data)) {
         dynamicModels = data.data.map(m => ({
           id: m.id,
-          name: m.id,
+          name: m.name || m.id,
+          context_length: m.context_length || 1000000,
         }));
         modelsLastFetch = now;
         log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
         return dynamicModels;
       }
     }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
+    log('warn', 'Provider models fetch failed, using fallback list', { status: response.status });
   } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
+    log('warn', 'Provider models fetch error, using fallback list', { error: e.message });
   }
 
-  // Fallback to hardcoded MODELS
-  return MODELS;
+  // Fallback to cached dynamicModels or hardcoded MODELS
+  return dynamicModels || MODELS;
 }
 
 async function handleModels(req, res) {
@@ -1871,9 +1918,12 @@ async function handleModels(req, res) {
     object: 'list',
     data: models.map(m => ({
       id: m.id,
+      name: m.name || m.id,
       object: 'model',
       created: now,
       owned_by: 'command-code',
+      context_length: m.context_length || 1000000,
+      max_model_len: m.context_length || 1000000,
     })),
   });
 }
@@ -1924,6 +1974,15 @@ process.on('unhandledRejection', (reason) => {
   } else {
     log('error', 'Unhandled rejection', { message: reason?.message || String(reason), stack: reason?.stack?.split('\n')[0] });
   }
+});
+
+server.on('error', (err) => {
+  if (err?.code === 'EADDRINUSE') {
+    log('info', `Port ${CFG.port} is already active (EADDRINUSE), exiting cleanly.`);
+    process.exit(0);
+  }
+  log('error', 'Server error', { message: err?.message || String(err) });
+  process.exit(1);
 });
 
 server.listen(CFG.port, CFG.host, () => {
