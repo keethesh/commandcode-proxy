@@ -148,12 +148,53 @@ refreshCCVersion(); // 启动时立即拉取
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
 // 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
+// ⚠️ 内存特性（issue #20 实测）：请求体在转发到上游前会同时存在多份副本 ——
+//    chunks[] / Buffer.concat / utf8 字符串 / JSON.parse 对象树 / buildCcRequest 重建对象树 / JSON.stringify 序列化体。
+//    实测峰值 ≈ body 大小 × 5.1~7.4（7MB→+52MB，20MB→+116MB；而 413 拒绝路径只要 ×1.05）。
+//    故 100MB 上限意味着「单个请求」最坏可吃 ~550MB，且该上限是每请求的、不是全局的。
+//    公网/多用户部署请在反向代理层同时限制 body 大小与在途请求数（见 README「内存与部署」）。
 const MAX_BODY_SIZE = (() => {
   const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
   return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
 })();
-const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
-const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
+// 上游读空闲超时（issue #19）：只计「reader.read() 的等待」，每收到一个 chunk 重置，
+// 不是整个请求的总时长。默认值保持不变（30s / 90s），可用环境变量覆盖 ——
+// 官方 CLI 对上游没有任何 idle timeout（反编译 command-code@1.50.0 已验证，
+// createApiClient 调用点均未传 timeout），合法的长思考停顿可达数百秒，
+// 遇到推理模型被 30s 误杀 / 触发 429 重试放大时，调大这两个值即可。
+const STREAM_IDLE_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_STREAM_IDLE_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 30000;   // 默认 30s — 流式无新数据中断
+})();
+const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_NONSTREAM_IDLE_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 90000;   // 默认 90s — 非流式超时更宽容
+})();
+
+// 客户端「僵死」保护：既不读也不断开时，该请求会连带上游连接一直挂着（背压修复后的残留）。
+// 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
+// 默认 0 = 禁用，保持既有行为不变：僵死客户端与「卡在工具执行的合法客户端」在协议层无法
+// 区分，而官方 CLI 对上游没有任何 idle timeout（issue #19），贸然加超时会误杀健康请求。
+// 在途请求上限（可选，默认关闭）。项目定位是纯反代层，并发控制属于下游（nginx
+// limit_conn，per-IP / per-key）；本项仅为「不挂反代裸跑」的场景提供一个可选的
+// 进程内全局兜底，不替代下游方案，也不感知客户端身份。
+// 内存 = 在途数 × (0.13MB + 5.5 × body_MB)：body 上限只管住单请求量级，乘数由本项封顶。
+// 超限返回 503 + Retry-After（SDK 会自行退避重试），而不是放任进程被 OOM 杀掉。
+// 默认 0 = 关闭，不限制并发（既有的反代层定位不变，行为零变化）；需要时按需开启：
+//   CC_MAX_INFLIGHT=32 npm start
+// 注意：body 上限只管住单请求量级，乘数由本项封顶。默认 body 上限 100MB 时，
+// N × 最坏 550MB —— 要硬性内存上界需同时下调 CC_MAX_BODY_MB。
+const MAX_INFLIGHT = (() => {
+  const n = Number.parseInt(process.env.CC_MAX_INFLIGHT ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;            // 默认 0 = 不限
+})();
+
+let inflightCount = 0;   // 当前在途请求数（不含 /health）
+
+const CLIENT_DRAIN_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_CLIENT_DRAIN_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 0;
+})();
 
 // 连续超时计数：连续 3 次超时才提醒压缩上下文，任意成功请求后重置
 let consecutiveTimeouts = 0;
@@ -166,6 +207,15 @@ function log(level, msg, data) {
   if (CFG.logFile) {
     try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
   }
+}
+
+// 把上游错误体摘要成单行，便于日志排查。
+// 之前 CC API error 只记 status，不记 body —— 遇到 400 只能靠猜（问题来源见 hk_sji 排查）。
+// 截断到 500 字符，避免异常大的 body 刷爆日志；同时压掉换行，保证一条日志一行。
+function summarizeUpstreamError(text, limit = 500) {
+  if (!text) return '';
+  const flat = String(text).replace(/\s+/g, ' ').trim();
+  return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
 }
 
 // ── 会话管理 ───────────────────────────────────────
@@ -439,11 +489,21 @@ function buildCcRequest(openaiReq) {
     }
     if (msg.role === 'assistant') {
       const parts = [];
+      // 思考内容必须回传：CC 在 thinking 模式下校验 reasoning 是否随历史带回，
+      // 丢弃会让上游直接拒绝。次序也必须与 CC CLI 的抓包格式一致 ——
+      // [reasoning, text, tool-call]，reasoning 在最前。
+      if (msg.reasoning_content) {
+        parts.push({ type: 'reasoning', text: msg.reasoning_content });
+      }
       if (msg.content && typeof msg.content === 'string') {
-        parts.push({ type: 'text', text: msg.content });
+        if (msg.content) parts.push({ type: 'text', text: msg.content });
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
+          if (!part) continue;
           if (part.type === 'text') parts.push(part);
+          // 客户端直接把 reasoning 放在 content 数组里时同样透传；
+          // 已有 reasoning_content 字段则不重复
+          else if (part.type === 'reasoning' && !msg.reasoning_content) parts.push(part);
         }
       }
       if (msg.tool_calls) {
@@ -705,6 +765,24 @@ function normalizeUsage(u) {
   }
 }
 
+// CC 的 inputTokens 是「总数」（含缓存命中部分），而 Anthropic 的 input_tokens 只计
+// 非缓存部分 —— 官方 SDK 注释：Total input tokens in a request is the summation of
+// `input_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens`。
+// 直接把 CC 的 inputTokens 当 input_tokens 转发，会让下游把两者当成互不重叠的两部分，
+// 相加后约为真实输入的两倍（issue #25）。
+//
+// CC 实际已经算好：inputTokenDetails.noCacheTokens（实测 noCacheTokens + cacheReadTokens
+// === inputTokens）。优先采用该字段；缺失时回退到减法，保证老版本上游也能得到正确值。
+function anthropicInputTokens(usage, noCacheOverride) {
+  const u = usage || {};
+  if (typeof noCacheOverride === 'number' && noCacheOverride >= 0) return noCacheOverride;
+  const noCache = u.inputTokenDetails && u.inputTokenDetails.noCacheTokens;
+  if (typeof noCache === 'number' && noCache >= 0) return noCache;
+  const cacheRead = u.cachedInputTokens || (u.inputTokenDetails && u.inputTokenDetails.cacheReadTokens) || 0;
+  const cacheWrite = (u.inputTokenDetails && u.inputTokenDetails.cacheWriteTokens) || 0;
+  return Math.max(0, (u.inputTokens || 0) - cacheRead - cacheWrite);
+}
+
 function mapFinishReason(reason) {
   switch (reason) {
     case 'tool-calls': return 'tool_calls';
@@ -836,6 +914,50 @@ function readBody(req) {
   });
 }
 
+// 下游背压：res.write() 返回 false 表示 socket 写缓冲已超 highWaterMark（消费者跟不上）。
+// 忽略它会让整个上游流在内存中无界堆积 —— 客户端不读时 RSS 随上游流一起增长（issue #20）。
+// 必须同时监听 close/error，否则客户端断连会让请求协程永久挂起。
+// CLIENT_DRAIN_TIMEOUT_MS > 0 时额外加一道空闲看门狗：超时则 destroy 该响应，
+// 由此触发既有的 res 'close' 处理器 → aborted=true → 中止 CC 上游，无需改动各调用点。
+function waitDrain(res) {
+  if (!res.writableNeedDrain) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer = null;
+    const done = () => {
+      res.off('drain', done); res.off('close', done); res.off('error', done);
+      if (timer) { clearTimeout(timer); timer = null; }
+      resolve();
+    };
+    res.once('drain', done); res.once('close', done); res.once('error', done);
+    if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
+      timer = setTimeout(() => {
+        log('warn', 'Client stalled on backpressure, dropping connection', {
+          path: res.req?.url || '(unknown)',
+          timeoutMs: CLIENT_DRAIN_TIMEOUT_MS,
+          bufferedBytes: res.writableLength,
+        });
+        try { res.destroy(); } catch {}
+        done();
+      }, CLIENT_DRAIN_TIMEOUT_MS);
+    }
+  });
+}
+
+// 上游读空闲看门狗：复用单个定时器，避免「每个 chunk 新建一个 setTimeout 且从不清理」。
+// 实测每个待触发定时器滞留约 225B；稳态滞留 = 吞吐 × 超时窗口 × 每响应 chunk 数 × 225B
+// （50 rps × 2000 chunk × 30s ≈ 644MB，非流式 90s 窗口约为其三倍）。
+// arm() 用 refresh() 把窗口重置为「本轮 read 开始」，与原实现语义一致：超时只计 reader.read() 的等待。
+function createIdleWatchdog(timeoutMs) {
+  let rejectFn = null;
+  const expired = new Promise((_, reject) => { rejectFn = reject; });
+  expired.catch(() => {}); // 读循环退出后定时器才触发时，避免 unhandledRejection
+  const timer = setTimeout(() => rejectFn(new Error('STREAM_IDLE_TIMEOUT')), timeoutMs);
+  return {
+    arm() { timer.refresh(); return expired; },
+    dispose() { clearTimeout(timer); },
+  };
+}
+
 function sendJSON(res, status, data) {
   const headers = { 'Content-Type': 'application/json' };
   if (data && data.retry_after !== undefined) {
@@ -947,7 +1069,7 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status });
+      log('error', 'CC API error', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendJSON(res, mapped.status, mapped.body);
       return;
@@ -997,22 +1119,24 @@ async function handleChatCompletions(req, res) {
       const decoder = new TextDecoder();
       reader = ccResponse.body.getReader();
 
+      const idle = createIdleWatchdog(STREAM_IDLE_TIMEOUT_MS);
       try {
         while (true) {
-          const result = await Promise.race([
-            reader.read(),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-            ),
-          ]);
+          const result = await Promise.race([reader.read(), idle.arm()]);
           const { done, value } = result;
           if (done) break;
           if (aborted) break;
           bytesReceived += value.length;
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
+          const chunkText = decoder.decode(value, { stream: true });
+          buffer += chunkText;
+          // 仅在新到数据含换行时才切分：buffer 中永不残留 '\n'，故无换行即无完整行。
+          // 避免对增长中的超长单行（大 tool-call / tool_result）反复做全量 split —— O(n²) → O(n)。
+          let lines = [];
+          if (chunkText.indexOf('\n') !== -1) {
+            lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+          }
 
           let hadOutput = false;
           for (const line of lines) {
@@ -1028,12 +1152,16 @@ async function handleChatCompletions(req, res) {
                 started = true;
               }
               for (const evt of events) res.write(evt);
+              await waitDrain(res);
               hadOutput = true;
             }
             if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
           }
           // silent events 期间发 keepalive，防止客户端超时断开
-          if (started && !hadOutput) { try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {} }
+          if (started && !hadOutput) {
+            try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {}
+            await waitDrain(res);
+          }
         }
 
         if (!aborted) {
@@ -1045,6 +1173,7 @@ async function handleChatCompletions(req, res) {
             if (events) {
               if (!started) started = true;
               for (const evt of events) res.write(evt);
+              await waitDrain(res);
             }
           }
           if (translator.upstreamError) {
@@ -1117,6 +1246,8 @@ async function handleChatCompletions(req, res) {
             try { res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'proxy_error' } })}\n\n`); } catch {}
           }
         }
+      } finally {
+        idle.dispose();
       }
 
       if (!res.writableEnded) res.end();
@@ -1176,19 +1307,18 @@ async function handleChatCompletions(req, res) {
         }
       };
 
+      const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
       while (true) {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-          ),
-        ]);
+        const result = await Promise.race([reader.read(), idle.arm()]);
         const { done, value } = result;
         if (done) break;
         bytesReceived += value.length;
-        buf += decoder.decode(value, { stream: true });
-        processLines();
+        const chunkText = decoder.decode(value, { stream: true });
+        buf += chunkText;
+        // 无换行则不可能产生完整行，跳过全量 split（见 handleChatCompletions 流式段同处说明）
+        if (chunkText.indexOf('\n') !== -1) processLines();
       }
+      idle.dispose();
       processLines();
 
       if (upstreamError) {
@@ -1314,7 +1444,8 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
       const estOut = Math.max(1,
         Math.ceil(((fullText || '').length + (thinkingText || '').length) / 4) + (toolCalls ? toolCalls.length * 20 : 0));
       return {
-        input_tokens: usage?.inputTokens ?? 0,
+        // input_tokens 只计非缓存部分（Anthropic 语义），与 cache_* 相加才等于总输入
+        input_tokens: anthropicInputTokens(usage),
         output_tokens: usage?.outputTokens || estOut,
         cache_creation_input_tokens: usage?.inputTokenDetails?.cacheWriteTokens ?? 0,
         cache_read_input_tokens: usage?.cachedInputTokens ?? 0,
@@ -1349,11 +1480,16 @@ function convertAnthropicToOpenAI(anthropicReq) {
   for (const msg of messages) {
     if (msg.role === 'assistant') {
       let textContent = '';
+      // Anthropic 的 thinking block 承载思考内容，需转成 reasoning_content
+      // 交给 buildCcRequest 回传，否则 CC 会因缺少 reasoning 而拒绝
+      let thinkingContent = '';
       const toolCalls = [];
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }];
       for (const block of blocks) {
         if (block.type === 'text') {
           textContent += block.text || '';
+        } else if (block.type === 'thinking') {
+          thinkingContent += block.thinking || '';
         } else if (block.type === 'tool_use') {
           toolNameFromId[block.id] = block.name;
           toolCalls.push({
@@ -1367,6 +1503,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
         }
       }
       const assistantMsg = { role: 'assistant', content: textContent || null };
+      if (thinkingContent) assistantMsg.reasoning_content = thinkingContent;
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       openaiMessages.push(assistantMsg);
     } else if (msg.role === 'user') {
@@ -1475,6 +1612,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let outputTokens = 0;
   let cachedInputTokens = 0;
   let cacheWriteTokens = 0;
+  let noCacheTokens = -1;   // -1 = 上游未提供该字段，改用减法兜底
   let stopReason = null;
   let hasError = false;
   let currentThinkingText = ''; // accumulated thinking text for the open block
@@ -1536,21 +1674,22 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  const idle = createIdleWatchdog(STREAM_IDLE_TIMEOUT_MS);
 
   try {
     while (true) {
-      const result = await Promise.race([
-        reader.read(),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-        ),
-      ]);
+      const result = await Promise.race([reader.read(), idle.arm()]);
       const { done, value } = result;
       if (done) break;
       ctx.bytesReceived += value.length;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      const chunkText = decoder.decode(value, { stream: true });
+      buffer += chunkText;
+      // 同 handleChatCompletions：无换行即无完整行，跳过全量 split
+      let lines = [];
+      if (chunkText.indexOf('\n') !== -1) {
+        lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+      }
 
       let hadOutput = false;
       for (const line of lines) {
@@ -1613,6 +1752,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
               outputTokens = u.outputTokens ?? outputTokens;
               cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
               cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
+              if (typeof u.inputTokenDetails?.noCacheTokens === 'number') {
+                noCacheTokens = u.inputTokenDetails.noCacheTokens;
+              }
               ctx.inputTokens = inputTokens;
               ctx.outputTokens = outputTokens;
               ctx.cachedInputTokens = cachedInputTokens;
@@ -1640,7 +1782,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       }
     }
 
-    // 无论上游是否回报 usage，都把本地计数同步进 ctx（零输出判定与 message_delta 账单依赖它）
+    // 无论上游是否回报 usage，都把本地计数同步进 ctx（零输出判定与超时日志依赖它）。
+    // 注意：ctx.inputTokens 保存的是上游原始总数，仅供日志排查；
+    // message_delta 的 input_tokens 走 anthropicInputTokens / noCacheTokens 换算，不读它。
     ctx.inputTokens = inputTokens;
     ctx.outputTokens = outputTokens;
     ctx.cachedInputTokens = cachedInputTokens;
@@ -1658,7 +1802,15 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
         yield `event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn' },
-          usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || 0, input_tokens: inputTokens },
+          usage: {
+            output_tokens: outputTokens,
+            cache_read_input_tokens: cachedInputTokens,
+            cache_creation_input_tokens: cacheWriteTokens || 0,
+            // 只计非缓存部分；否则下游把 input 与 cache_read 相加会得到约两倍（issue #25）
+            input_tokens: noCacheTokens >= 0
+              ? noCacheTokens
+              : Math.max(0, inputTokens - cachedInputTokens - (cacheWriteTokens || 0)),
+          },
         })}\n\n`;
 
         yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
@@ -1666,6 +1818,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
     }
   } finally {
     // 确保流中断时通知上游
+    idle.dispose();
     try { reader.cancel(); } catch {}
   }
 }
@@ -1722,7 +1875,7 @@ async function handleMessages(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status });
+      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
@@ -1767,13 +1920,14 @@ async function handleMessages(req, res) {
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
       };
-      const flushBuf = () => {
+      const flushBuf = async () => {
         if (!started) {
           res.writeHead(200, SSE_HEADERS);
           started = true;
         }
         for (const ev of buf) { try { res.write(ev); } catch {} }
         buf.length = 0;
+        await waitDrain(res);
       };
 
       // 心跳：等价于 chat 端点的 ': keepalive'——chat 在每轮读到静默事件时发注释行，
@@ -1781,7 +1935,9 @@ async function handleMessages(req, res) {
       // 事件，官方 SDK 会忽略），覆盖上游排队/长 thinking 的静默窗口
       let lastSentAt = Date.now();
       const heartbeat = setInterval(() => {
-        if (started && !aborted && !res.writableEnded && Date.now() - lastSentAt > 15000) {
+        // 不向已积压的下游继续塞数据：定时器回调是同步的，无法 await waitDrain，
+        // 因此用 writableNeedDrain 直接跳过本轮心跳（背压场景下少发一个 ping 无副作用）
+        if (started && !aborted && !res.writableEnded && !res.writableNeedDrain && Date.now() - lastSentAt > 15000) {
           try { res.write('event: ping\ndata: {"type":"ping"}\n\n'); lastSentAt = Date.now(); } catch {}
         }
       }, 5000);
@@ -1794,11 +1950,12 @@ async function handleMessages(req, res) {
         for await (const event of generator) {
           if (aborted) break;
           if (!started && !event.startsWith('event: message_start')) {
-            flushBuf();
+            await flushBuf();
           }
           if (started) {
             try { res.write(event); } catch {}
             lastSentAt = Date.now();
+            await waitDrain(res);
           } else {
             buf.push(event);
           }
@@ -1822,9 +1979,9 @@ async function handleMessages(req, res) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
               return;
             }
-            flushBuf();
+            await flushBuf();
           } else {
-            flushBuf();
+            await flushBuf();
           }
         }
       } catch (e) {
@@ -1935,19 +2092,18 @@ async function handleMessages(req, res) {
         }
       };
 
+      const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
       while (true) {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-          ),
-        ]);
+        const result = await Promise.race([reader.read(), idle.arm()]);
         const { done, value } = result;
         if (done) break;
         bytesReceived += value.length;
-        buf += decoder.decode(value, { stream: true });
-        processLines();
+        const chunkText = decoder.decode(value, { stream: true });
+        buf += chunkText;
+        // 无换行则不可能产生完整行，跳过全量 split
+        if (chunkText.indexOf('\n') !== -1) processLines();
       }
+      idle.dispose();
       processLines();
 
       if (upstreamError) {
@@ -2048,6 +2204,671 @@ async function fetchModels(apiKey) {
   return dynamicModels || MODELS;
 }
 
+// ── OpenAI Responses API（/v1/responses）──────────────
+// 供 Codex 等使用 Responses 协议的客户端接入。代理仍是无状态转换层：
+// 把 input 翻译成内部 Chat 格式，复用同一套 CC 转发管线。
+// 不支持 previous_response_id / store（需要服务端保存会话，与无状态定位冲突），
+// 收到直接 400，避免静默降级成错误答案。
+
+function responsesTextOf(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map(p => (p && typeof p === 'object' ? (p.text || '') : '')).join('');
+}
+
+function responsesReasoningOf(item) {
+  if (!item) return '';
+  if (Array.isArray(item.summary) && item.summary.length) return item.summary.map(p => (p && p.text) || '').join('');
+  if (Array.isArray(item.content) && item.content.length) return item.content.map(p => (p && p.text) || '').join('');
+  return typeof item.text === 'string' ? item.text : '';
+}
+
+function newResponsesId(prefix) {
+  return prefix + randomUUID().replace(/-/g, '').slice(0, 24);
+}
+
+function convertResponsesToChat(respReq) {
+  const messages = [];
+
+  if (respReq.instructions !== undefined && respReq.instructions !== null) {
+    const sys = responsesTextOf(respReq.instructions);
+    if (sys) messages.push({ role: 'system', content: sys });
+  }
+
+  // Responses 把 reasoning / message / function_call 拆成并列 item，
+  // Chat 要求它们挂在同一条 assistant 消息上，故先累积再冲刷。
+  let pending = null;
+  const ensurePending = () => (pending = pending || { role: 'assistant', content: null, tool_calls: [] });
+  const flushPending = () => {
+    if (!pending) return;
+    if (!pending.tool_calls.length) delete pending.tool_calls;
+    if (!pending.reasoning_content) delete pending.reasoning_content;
+    if (pending.content === null && !pending.tool_calls) { pending = null; return; }
+    messages.push(pending);
+    pending = null;
+  };
+
+  const input = respReq.input;
+  if (typeof input === 'string') {
+    messages.push({ role: 'user', content: input });
+  } else if (Array.isArray(input)) {
+    for (const item of input) {
+      if (!item || typeof item !== 'object') continue;
+      switch (item.type) {
+        case 'reasoning': {
+          const t = responsesReasoningOf(item);
+          if (t) ensurePending().reasoning_content = t;
+          break;
+        }
+        case 'message': {
+          const text = responsesTextOf(item.content);
+          if (item.role === 'assistant') {
+            if (text) ensurePending().content = text;
+          } else if (item.role === 'system' || item.role === 'developer') {
+            flushPending();
+            messages.push({ role: 'system', content: text });
+          } else {
+            flushPending();
+            messages.push({ role: 'user', content: text });
+          }
+          break;
+        }
+        case 'function_call': {
+          ensurePending().tool_calls.push({
+            id: item.call_id || item.id || ('call_' + randomUUID().slice(0, 8)),
+            type: 'function',
+            function: { name: item.name || '', arguments: item.arguments || '{}' },
+          });
+          break;
+        }
+        case 'function_call_output': {
+          flushPending();
+          messages.push({
+            role: 'tool',
+            tool_call_id: item.call_id || '',
+            content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output === undefined ? '' : item.output),
+          });
+          break;
+        }
+        default: break;
+      }
+    }
+  }
+  flushPending();
+
+  let tools;
+  if (Array.isArray(respReq.tools) && respReq.tools.length) {
+    tools = respReq.tools.filter(t => t && (t.type === 'function' || t.name)).map(t => ({
+      type: 'function',
+      function: {
+        name: t.name || '',
+        description: t.description || '',
+        parameters: t.parameters || { type: 'object', properties: {} },
+      },
+    }));
+    if (!tools.length) tools = undefined;
+  }
+
+  let toolChoice;
+  const tc = respReq.tool_choice;
+  if (typeof tc === 'string') toolChoice = tc;
+  else if (tc && typeof tc === 'object' && tc.name) toolChoice = { type: 'function', function: { name: tc.name } };
+
+  const out = { model: respReq.model, messages, stream: respReq.stream === true };
+  if (tools) out.tools = tools;
+  if (toolChoice) out.tool_choice = toolChoice;
+  if (respReq.max_output_tokens !== undefined) out.max_tokens = respReq.max_output_tokens;
+  if (respReq.temperature !== undefined) out.temperature = respReq.temperature;
+  if (respReq.top_p !== undefined) out.top_p = respReq.top_p;
+  if (respReq.parallel_tool_calls !== undefined) out.parallel_tool_calls = respReq.parallel_tool_calls;
+  const eff = respReq.reasoning && typeof respReq.reasoning === 'object' ? respReq.reasoning.effort : undefined;
+  if (eff) out.reasoning_effort = eff;
+  return out;
+}
+
+// Responses 的 input_tokens 是总数，cached / cache_write 均为其子集 ——
+// 与 Anthropic 相反（那里 cache_read 是独立增量，必须做减法，见 issue #25）。
+// 本代理上游 CC 的 inputTokens 同样已含缓存，故此处直接沿用、不做减法。
+// 实测：total_tokens === input_tokens + output_tokens（即使 cached 占绝大多数）。
+function buildResponsesUsage(usage, fallbackOutputTokens) {
+  const u = usage || {};
+  normalizeUsage(u);
+  const inTok = u.inputTokens || 0;
+  const outTok = u.outputTokens || fallbackOutputTokens || 0;
+  return {
+    input_tokens: inTok,
+    // 规范里 cached_tokens 与 cache_write_tokens 都是 required
+    input_tokens_details: {
+      cached_tokens: u.cachedInputTokens || 0,
+      cache_write_tokens: (u.inputTokenDetails && u.inputTokenDetails.cacheWriteTokens) || 0,
+    },
+    output_tokens: outTok,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: inTok + outTok,
+  };
+}
+
+function buildResponsesOutput(fullText, thinkingText, toolCalls) {
+  const output = [];
+  if (thinkingText) {
+    output.push({ type: 'reasoning', id: newResponsesId('rs_'), summary: [{ type: 'summary_text', text: thinkingText }] });
+  }
+  if (fullText) {
+    output.push({
+      type: 'message', id: newResponsesId('msg_'), status: 'completed', role: 'assistant',
+      content: [{ type: 'output_text', text: fullText, annotations: [] }],
+    });
+  }
+  for (const tc of (toolCalls || [])) {
+    const rawArgs = tc.function ? tc.function.arguments : '{}';
+    output.push({
+      type: 'function_call', id: newResponsesId('fc_'), call_id: tc.id,
+      name: tc.function ? (tc.function.name || '') : '',
+      arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs || {}),
+      status: 'completed',
+    });
+  }
+  return output;
+}
+
+function buildResponsesObject(responseId, model, created, fullText, thinkingText, toolCalls, usage, opts) {
+  const o = opts || {};
+  const truncated = o.finishReason === 'length';
+  return {
+    id: responseId,
+    object: 'response',
+    created_at: created,
+    status: truncated ? 'incomplete' : 'completed',
+    completed_at: nowUnix(),
+    error: null,
+    incomplete_details: truncated ? { reason: 'max_output_tokens' } : null,
+    input: o.input || [],
+    instructions: o.instructions === undefined ? null : o.instructions,
+    max_output_tokens: o.max_output_tokens === undefined ? null : o.max_output_tokens,
+    model,
+    output: buildResponsesOutput(fullText, thinkingText, toolCalls),
+    output_text: fullText || '',
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: o.reasoning || null,
+    store: false,
+    temperature: o.temperature === undefined ? 1 : o.temperature,
+    text: { format: { type: 'text' } },
+    tool_choice: o.tool_choice || 'auto',
+    tools: o.tools || [],
+    top_p: o.top_p === undefined ? 1 : o.top_p,
+    truncation: 'disabled',
+    usage: buildResponsesUsage(usage, 0),
+    user: null,
+    metadata: {},
+  };
+}
+
+function sendResponsesError(res, status, type, message, retryAfter) {
+  const body = { error: { message, type, code: null, param: null } };
+  if (retryAfter !== undefined) body.retry_after = retryAfter;
+  sendJSON(res, status, body);
+}
+
+// CC NDJSON → Responses 具名 SSE 事件（每个事件都必需的 sequence_number 递增发送）
+function createResponsesSseTranslator(model, responseId, created) {
+  let seq = 0;
+  const sse = (type, data) => 'event: ' + type + '\ndata: ' + JSON.stringify(Object.assign({ type, sequence_number: seq++ }, data)) + '\n\n';
+  let createdSent = false;
+  let current = null;
+  let outputIndex = 0;
+  const doneItems = [];
+  let usage = null;
+  let textAcc = '';
+  let finishReason = null;
+
+  const baseResponse = (status, output) => ({
+    id: responseId, object: 'response', created_at: created, status,
+    output: output || [], output_text: '', model, error: null, incomplete_details: null,
+    parallel_tool_calls: true, previous_response_id: null, store: false, tools: [], metadata: {},
+  });
+
+  function startResponse() {
+    createdSent = true;
+    return [
+      sse('response.created', { response: baseResponse('in_progress') }),
+      sse('response.in_progress', { response: baseResponse('in_progress') }),
+    ];
+  }
+
+  function closeItem() {
+    if (!current) return [];
+    const out = [];
+    const item = current.item;
+    const idx = current.index;
+    if (current.kind === 'message') {
+      out.push(sse('response.output_text.done', { item_id: item.id, output_index: idx, content_index: 0, text: current.textBuf, logprobs: [] }));
+      out.push(sse('response.content_part.done', {
+        item_id: item.id, output_index: idx, content_index: 0,
+        part: { type: 'output_text', text: current.textBuf, annotations: [] },
+      }));
+      item.content = [{ type: 'output_text', text: current.textBuf, annotations: [] }];
+      item.status = 'completed';
+    } else if (current.kind === 'function_call') {
+      out.push(sse('response.function_call_arguments.done', { item_id: item.id, output_index: idx, arguments: item.arguments }));
+      item.status = 'completed';
+    } else if (current.kind === 'reasoning') {
+      out.push(sse('response.reasoning_summary_text.done', { item_id: item.id, output_index: idx, summary_index: 0, text: current.textBuf }));
+      out.push(sse('response.reasoning_summary_part.done', {
+        item_id: item.id, output_index: idx, summary_index: 0,
+        part: { type: 'summary_text', text: current.textBuf },
+      }));
+      item.summary = [{ type: 'summary_text', text: current.textBuf }];
+      item.status = 'completed';
+    }
+    out.push(sse('response.output_item.done', { output_index: idx, item }));
+    doneItems.push(item);
+    current = null;
+    return out;
+  }
+
+  function openItem(kind, item) {
+    const out = closeItem();
+    current = { kind, index: outputIndex++, item, textBuf: '' };
+    out.push(sse('response.output_item.added', { output_index: current.index, item }));
+    if (kind === 'message') {
+      out.push(sse('response.content_part.added', {
+        item_id: item.id, output_index: current.index, content_index: 0,
+        part: { type: 'output_text', text: '', annotations: [] },
+      }));
+    } else if (kind === 'reasoning') {
+      out.push(sse('response.reasoning_summary_part.added', {
+        item_id: item.id, output_index: current.index, summary_index: 0,
+        part: { type: 'summary_text', text: '' },
+      }));
+    }
+    return out;
+  }
+
+  return {
+    lastCcEvent: '',
+    upstreamError: null,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    get started() { return createdSent; },
+    get stopReason() { return finishReason; },
+    parseLine(line) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
+      let event;
+      try { event = JSON.parse(trimmed); } catch { return null; }
+      if (!event.type) return null;
+      this.lastCcEvent = event.type;
+      const out = [];
+
+      switch (event.type) {
+        case 'text-start': case 'reasoning-start': case 'start': case 'start-step':
+          break;
+
+        case 'text-delta': {
+          const text = event.text || event.delta || '';
+          if (!text) break;
+          if (!createdSent) out.push.apply(out, startResponse());
+          if (!current || current.kind !== 'message') {
+            out.push.apply(out, openItem('message', { type: 'message', id: newResponsesId('msg_'), status: 'in_progress', role: 'assistant', content: [] }));
+          }
+          current.textBuf += text;
+          textAcc += text;
+          out.push(sse('response.output_text.delta', { item_id: current.item.id, output_index: current.index, content_index: 0, delta: text, logprobs: [] }));
+          break;
+        }
+
+        case 'reasoning-delta': {
+          const text = event.text || '';
+          if (!text) break;
+          if (!createdSent) out.push.apply(out, startResponse());
+          if (!current || current.kind !== 'reasoning') {
+            out.push.apply(out, openItem('reasoning', { type: 'reasoning', id: newResponsesId('rs_'), summary: [], status: 'in_progress' }));
+          }
+          current.textBuf += text;
+          out.push(sse('response.reasoning_summary_text.delta', {
+            item_id: current.item.id, output_index: current.index, summary_index: 0, delta: text,
+          }));
+          break;
+        }
+
+        case 'tool-call': {
+          if (!createdSent) out.push.apply(out, startResponse());
+          const callId = event.toolCallId || newResponsesId('call_');
+          const args = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
+          out.push.apply(out, openItem('function_call', {
+            type: 'function_call', id: newResponsesId('fc_'), call_id: callId,
+            name: event.toolName || '', arguments: '', status: 'in_progress',
+          }));
+          current.item.arguments = args;
+          out.push(sse('response.function_call_arguments.delta', { item_id: current.item.id, output_index: current.index, delta: args }));
+          break;
+        }
+
+        case 'finish': {
+          finishReason = event.finishReason || null;
+          const u = event.totalUsage || event.usage || null;
+          if (u) {
+            normalizeUsage(u);
+            usage = u;
+            this.inputTokens = u.inputTokens || 0;
+            this.outputTokens = u.outputTokens || 0;
+            this.cachedInputTokens = u.cachedInputTokens || 0;
+          }
+          break;
+        }
+
+        case 'error': {
+          this.upstreamError = mapCcEventError(event);
+          break;
+        }
+
+        default: break;
+      }
+      return out.length ? out : null;
+    },
+    finish() {
+      if (!createdSent) return [];
+      const out = closeItem();
+      // finishReason=length 表示被 max_output_tokens 截断：规范要求 status=incomplete
+      const truncated = finishReason === 'length';
+      out.push(sse(truncated ? 'response.incomplete' : 'response.completed', {
+        response: Object.assign(baseResponse(truncated ? 'incomplete' : 'completed', doneItems.slice()), {
+          output_text: textAcc,
+          incomplete_details: truncated ? { reason: 'max_output_tokens' } : null,
+          usage: buildResponsesUsage(usage, this.outputTokens),
+        }),
+      }));
+      return out;
+    },
+    fail(message) {
+      if (!createdSent) return [];
+      return [sse('response.failed', {
+        response: Object.assign(baseResponse('failed'), {
+          error: { code: 'upstream_error', message: message || 'Upstream error' },
+        }),
+      })];
+    },
+    errorEvent(message) {
+      return sse('error', { code: null, message: message || 'Upstream error', param: null });
+    },
+  };
+}
+
+async function handleResponses(req, res) {
+  let respReq;
+  try {
+    respReq = await readBody(req);
+  } catch (e) {
+    if (e.statusCode === 413) { sendResponsesError(res, 413, 'invalid_request_error', e.message); return; }
+    sendResponsesError(res, 400, 'invalid_request_error', 'Invalid JSON body');
+    return;
+  }
+
+  if (respReq.previous_response_id) {
+    sendResponsesError(res, 400, 'invalid_request_error',
+      'previous_response_id is not supported (this proxy is stateless); send the full input each turn');
+    return;
+  }
+
+  const apiKey = getApiKey(req.headers);
+  if (!apiKey) {
+    sendResponsesError(res, 401, 'authentication_error',
+      'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
+    return;
+  }
+
+  let chatReq = convertResponsesToChat(respReq);
+  if (!chatReq.messages.length) {
+    sendResponsesError(res, 400, 'invalid_request_error', 'input is required');
+    return;
+  }
+
+  const stream = chatReq.stream === true;
+  const model = chatReq.model || 'deepseek/deepseek-v4-flash';
+  const responseId = newResponsesId('resp_');
+  const created = nowUnix();
+  const echoOpts = {
+    instructions: respReq.instructions === undefined ? null : respReq.instructions,
+    max_output_tokens: respReq.max_output_tokens === undefined ? null : respReq.max_output_tokens,
+    temperature: respReq.temperature,
+    top_p: respReq.top_p,
+    reasoning: respReq.reasoning || null,
+    tool_choice: typeof respReq.tool_choice === 'string' ? respReq.tool_choice : 'auto',
+    tools: respReq.tools || [],
+  };
+  const ccBody = buildCcRequest(chatReq);
+  const promptCacheKey = chatReq.prompt_cache_key;
+  chatReq = null;
+
+  const abortController = new AbortController();
+  let aborted = false;
+  const startTime = Date.now();
+  let bytesReceived = 0;
+  let lastCcEvent = '';
+  let reader = null;
+  let translator = null;
+
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    aborted = true;
+    log('warn', 'Client disconnected', {
+      path: '/v1/responses', model, responseId, elapsedMs: Date.now() - startTime,
+      bytesSent: bytesReceived, lastCcEvent: lastCcEvent || '(none)',
+    });
+    if (!abortController.signal.aborted) { try { abortController.abort(); } catch (e2) {} }
+  });
+
+  try {
+    await ensureInitialized(apiKey, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+
+    if (!ccResponse.ok) {
+      const errorText = await ccResponse.text().catch(() => '');
+      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', body: summarizeUpstreamError(errorText) });
+      const mapped = mapCcError(ccResponse.status, errorText);
+      sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
+      return;
+    }
+
+    if (stream) {
+      translator = createResponsesSseTranslator(model, responseId, created);
+      let buffer = '';
+      let started = false;
+      const decoder = new TextDecoder();
+      reader = ccResponse.body.getReader();
+      const idle = createIdleWatchdog(STREAM_IDLE_TIMEOUT_MS);
+      const SSE_HEADERS = {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      };
+      const writeEvents = async (evts) => {
+        if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
+        for (const e2 of evts) res.write(e2);
+        await waitDrain(res);
+      };
+
+      try {
+        while (true) {
+          const result = await Promise.race([reader.read(), idle.arm()]);
+          const done = result.done;
+          const value = result.value;
+          if (done) break;
+          if (aborted || res.destroyed) break;
+          bytesReceived += value.length;
+
+          const chunkText = decoder.decode(value, { stream: true });
+          buffer += chunkText;
+          let lines = [];
+          if (chunkText.indexOf('\n') !== -1) {
+            lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+          }
+
+          for (const line of lines) {
+            const evts = translator.parseLine(line);
+            if (evts) await writeEvents(evts);
+            if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
+          }
+        }
+
+        if (!aborted) {
+          if (buffer.trim()) {
+            const evts = translator.parseLine(buffer);
+            if (evts) await writeEvents(evts);
+          }
+          if (translator.upstreamError) {
+            if (!started) {
+              sendResponsesError(res, translator.upstreamError.status,
+                translator.upstreamError.body.error.type, translator.upstreamError.body.error.message,
+                translator.upstreamError.body.retry_after);
+              return;
+            }
+            const failed = translator.fail(translator.upstreamError.body.error.message);
+            if (failed.length) await writeEvents(failed);
+          } else if (translator.outputTokens === 0 && !translator.started) {
+            try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
+            sendResponsesError(res, 429, 'rate_limit_error',
+              'Empty response from upstream (zero output tokens)', 10);
+            return;
+          } else {
+            if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
+            for (const e2 of translator.finish()) res.write(e2);
+          }
+          consecutiveTimeouts = 0;
+        }
+      } catch (e) {
+        if (aborted) {
+          try { reader.cancel(); } catch (e2) {}
+        } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+          log('warn', 'Stream idle timeout', {
+            path: '/v1/responses', model, streaming: true, timeoutMs: STREAM_IDLE_TIMEOUT_MS,
+            elapsedMs: Date.now() - startTime, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
+          });
+          consecutiveTimeouts++;
+          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+            ? 'Response timeout - try reducing context length (summarize earlier messages)'
+            : 'Response timeout - request timed out';
+          if (!started) { sendResponsesError(res, 429, 'rate_limit_error', timeoutMsg, 5); return; }
+          if (!res.writableEnded) {
+            try { res.write(translator.errorEvent(timeoutMsg)); } catch (e2) {}
+            try { res.destroy(); } catch (e2) {}
+          }
+        } else {
+          log('error', 'Stream error', { message: e.message, path: '/v1/responses' });
+          try { abortController.abort(); } catch (e2) {}
+          if (!started) {
+            sendResponsesError(res, 502, 'proxy_error', 'Upstream error: ' + e.message, 10);
+            return;
+          }
+          if (!res.writableEnded) {
+            try { res.write(translator.errorEvent(e.message)); } catch (e2) {}
+          }
+        }
+      } finally {
+        idle.dispose();
+      }
+
+      if (!res.writableEnded) res.end();
+    } else {
+      // ── 非流式：缓冲完整 NDJSON 后一次性构造 Responses 对象 ──
+      let fullText = '';
+      let thinkingText = '';
+      let usage = null;
+      let finishReason = 'stop';
+      let upstreamError = null;
+      const toolCalls = [];
+      reader = ccResponse.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      const processLines = () => {
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
+          let event;
+          try { event = JSON.parse(trimmed); } catch (e2) { continue; }
+          switch (event.type) {
+            case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
+            case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break;
+            case 'tool-call': {
+              lastCcEvent = event.type;
+              toolCalls.push({
+                id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
+                type: 'function',
+                function: {
+                  name: event.toolName || '',
+                  arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+                },
+              });
+              break;
+            }
+            case 'finish':
+              lastCcEvent = event.type;
+              finishReason = mapFinishReason(event.finishReason || 'stop');
+              if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
+              break;
+            case 'error':
+              lastCcEvent = event.type;
+              log('warn', 'CC stream error (non-stream)', { message: event.error ? event.error.message : event.message });
+              upstreamError = mapCcEventError(event);
+              break;
+            default:
+              log('warn', 'Unknown CC event type', { type: event.type });
+              break;
+          }
+        }
+      };
+
+      const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
+      while (true) {
+        const result = await Promise.race([reader.read(), idle.arm()]);
+        const done = result.done;
+        const value = result.value;
+        if (done) break;
+        bytesReceived += value.length;
+        const chunkText = decoder.decode(value, { stream: true });
+        buf += chunkText;
+        if (chunkText.indexOf('\n') !== -1) processLines();
+      }
+      idle.dispose();
+      processLines();
+
+      if (upstreamError) {
+        sendResponsesError(res, upstreamError.status, upstreamError.body.error.type,
+          upstreamError.body.error.message, upstreamError.body.retry_after);
+        return;
+      }
+
+      if (!fullText && !thinkingText && !toolCalls.length) {
+        try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
+        sendResponsesError(res, 429, 'rate_limit_error',
+          'Empty response from upstream (zero output tokens)', 10);
+        return;
+      }
+
+      consecutiveTimeouts = 0;
+      echoOpts.finishReason = finishReason;
+      sendJSON(res, 200, buildResponsesObject(
+        responseId, model, created, fullText, thinkingText, toolCalls, usage, echoOpts));
+    }
+  } catch (e) {
+    if (e.name === 'AbortError' || e.code === 'ABORT_ERR') return;
+    log('error', 'Responses handler error', { message: e.message });
+    if (!res.headersSent) {
+      sendResponsesError(res, 502, 'proxy_error', 'Upstream error: ' + e.message, 10);
+    } else if (!res.writableEnded) {
+      try { res.write(translator ? translator.errorEvent(e.message) : ''); } catch (e2) {}
+      try { res.end(); } catch (e2) {}
+    }
+  }
+}
+
 async function handleModels(req, res) {
   const apiKey = getApiKey(req.headers);
   const models = await fetchModels(apiKey);
@@ -2087,11 +2908,39 @@ const server = http.createServer(async (req, res) => {
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
 
+  // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
+  const isLiveness = url.pathname === '/health' || url.pathname === '/';
+  if (!isLiveness && MAX_INFLIGHT > 0) {
+    if (inflightCount >= MAX_INFLIGHT) {
+      log('warn', 'In-flight limit reached, rejecting request', {
+        maxInflight: MAX_INFLIGHT, inflight: inflightCount, path: url.pathname,
+      });
+      sendJSON(res, 503, {
+        error: { message: `Too many concurrent requests (limit ${MAX_INFLIGHT}), retry shortly`, type: 'server_busy' },
+        retry_after: 5,
+      });
+      return;
+    }
+    inflightCount++;
+    // 释放时机：响应写完（finish）或连接终止（close）—— 取先到者，且幂等，
+    // 保证任何退出路径（成功/出错/客户端断连/超时）都不会泄漏槽位。
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (inflightCount > 0) inflightCount--;
+    };
+    res.once('finish', release);
+    res.once('close', release);
+  }
+
   try {
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
       await handleMessages(req, res);
+    } else if (url.pathname === '/v1/responses' && req.method === 'POST') {
+      await handleResponses(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
@@ -2132,7 +2981,23 @@ server.listen(CFG.port, CFG.host, () => {
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
+    clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
+    idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
+    maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
   });
+  if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
+    log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
+  }
+  // 内存提示：body 上限隐含的最坏内存 = 上限 × 实测放大系数（见 MAX_BODY_SIZE 注释 / issue #20）
+  const bodyCapMB = Math.round(MAX_BODY_SIZE / 1048576);
+  const worstCaseMB = Math.round(bodyCapMB * 5.5);
+  if (worstCaseMB >= 500) {
+    log('warn', 'Request body limit implies high per-request worst-case memory', {
+      maxBodyMB: bodyCapMB,
+      worstCaseRSSPerRequestMB: worstCaseMB,
+      hint: 'lower CC_MAX_BODY_MB and/or cap in-flight requests at the reverse proxy (see README)',
+    });
+  }
   if (!CFG.apiKey) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
