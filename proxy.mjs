@@ -835,13 +835,16 @@ function mapCcError(ccStatus, ccBody) {
         error: {
           // OMP's key-rotation reader parses retry timing only out of the
           // message text (never headers/JSON fields at this layer) -- embed
-          // retry-after-ms so "insufficient credits" doesn't fall back to a
-          // 30min hard block on a key that may already be fine again.
-          message: `${message} (retry-after-ms=0)`,
+          // retry-after-ms so a bad key gets excluded for a bounded window
+          // instead of either a 30min hard block or (retry-after-ms=0,
+          // which OMP reads as "block already expired" -> re-picks the
+          // SAME dead key every attempt -> zero-backoff tight loop) never
+          // being excluded at all.
+          message: `${message} (retry-after-ms=30000)`,
           type: 'insufficient_quota',
           code: 'insufficient_quota',
         },
-        retry_after: 0,
+        retry_after: 30,
       },
     };
   }
