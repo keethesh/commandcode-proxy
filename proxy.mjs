@@ -1061,6 +1061,15 @@ async function handleChatCompletions(req, res) {
   }
 
   const apiKey = getApiKey(req.headers);
+  const authHdr = req.headers['authorization'] || req.headers['Authorization'] || '';
+  log('info', 'Chat completion request received', {
+    authHeaderPresent: !!authHdr,
+    authHeaderPrefix: authHdr.slice(0, 17),
+    resolvedKeyPrefix: apiKey ? apiKey.slice(0, 12) : 'none',
+    stream: openaiReq.stream === true,
+    model: openaiReq.model,
+  });
+
   if (!apiKey) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
@@ -1091,7 +1100,11 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
+      log('error', 'CC API error', {
+        keyPrefix: apiKey ? apiKey.slice(0, 12) : 'none',
+        status: ccResponse.status,
+        body: summarizeUpstreamError(errorText),
+      });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendJSON(res, mapped.status, mapped.body);
       return;
