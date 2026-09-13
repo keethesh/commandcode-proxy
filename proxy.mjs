@@ -833,7 +833,11 @@ function mapCcError(ccStatus, ccBody) {
       status: 429,
       body: {
         error: {
-          message,
+          // OMP's key-rotation reader parses retry timing only out of the
+          // message text (never headers/JSON fields at this layer) -- embed
+          // retry-after-ms so "insufficient credits" doesn't fall back to a
+          // 30min hard block on a key that may already be fine again.
+          message: `${message} (retry-after-ms=0)`,
           type: 'insufficient_quota',
           code: 'insufficient_quota',
         },
@@ -847,7 +851,7 @@ function mapCcError(ccStatus, ccBody) {
     return {
       status: 429,
       body: {
-        error: { message, type: 'rate_limit_error' },
+        error: { message: `${message} (retry-after-ms=30000)`, type: 'rate_limit_error' },
         retry_after: 30,
       },
     };
@@ -867,7 +871,7 @@ function mapCcEventError(event) {
   if (mapped.status === 429) {
     return {
       status: 429,
-      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+      body: { error: { message: `${message} (retry-after-ms=30000)`, type: 'rate_limit_error' }, retry_after: 30 },
     };
   }
 
