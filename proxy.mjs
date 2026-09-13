@@ -829,17 +829,19 @@ function mapCcError(ccStatus, ccBody) {
     || rawType === 'insufficient_quota';
 
   if (isQuota) {
+    // 402, not 429: OMP's transport (fetchWithRetry) treats 429/408/5xx as
+    // locally retryable and sleeps+resends with the SAME key up to 6x before
+    // ever trying a sibling credential (~150s wasted hammering a dead key
+    // for a 30s retry-after). 402 isn't in that retryable set, so it skips
+    // local retry and goes straight to auth-storage credential rotation.
+    // OMP's is402BillingCapBody() already recognizes "insufficient_quota"/
+    // "quota exceeded" wording on a 402 as a rotatable usage-limit outcome.
+    // retry-after-ms still sizes the exclusion window on the credential
+    // (30s, not OMP's 30min default) once markUsageLimitReached runs.
     return {
-      status: 429,
+      status: 402,
       body: {
         error: {
-          // OMP's key-rotation reader parses retry timing only out of the
-          // message text (never headers/JSON fields at this layer) -- embed
-          // retry-after-ms so a bad key gets excluded for a bounded window
-          // instead of either a 30min hard block or (retry-after-ms=0,
-          // which OMP reads as "block already expired" -> re-picks the
-          // SAME dead key every attempt -> zero-backoff tight loop) never
-          // being excluded at all.
           message: `${message} (retry-after-ms=30000)`,
           type: 'insufficient_quota',
           code: 'insufficient_quota',
@@ -869,8 +871,21 @@ function mapCcEventError(event) {
   const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
-  // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
-  // 否则客户端 SDK 拿不到退避提示（402 也映射成 429，一视同仁）
+  // 与 mapCcError 保持一致：账户级余额耗尽走 402（OMP 传输层不会本地重试
+  // 429/408/5xx 之外的状态码，402 会直接冒泡到凭证轮换，而不是本地睡眠
+  // 重试同一个已耗尽的 key 最多 6 次）。
+  const isQuota = /insufficients+(?:credits|balance)|weekly usage limit|usage_limit_reached|quotas+(?:exceeded|reached)|free.?usage.?limit|go.?usage.?limit/i.test(message)
+    || ccStatus === 402;
+  if (isQuota) {
+    return {
+      status: 402,
+      body: {
+        error: { message: `${message} (retry-after-ms=30000)`, type: 'insufficient_quota', code: 'insufficient_quota' },
+        retry_after: 30,
+      },
+    };
+  }
+
   if (mapped.status === 429) {
     return {
       status: 429,
