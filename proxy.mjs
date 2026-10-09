@@ -6,7 +6,8 @@ import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
-import { resolve, dirname } from 'path';
+import { resolve, dirname, join } from 'path';
+import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
 // ── 配置加载 ──────────────────────────────────────
@@ -562,7 +563,7 @@ function buildCcRequest(openaiReq) {
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
-      max_tokens: Math.min(max_tokens || 64000, 200000),
+      max_tokens: max_tokens ? Math.min(Math.max(max_tokens + 2048, 4096), 200000) : 64000,
       stream: true,  // CC API 总是 stream
     },
   };
@@ -583,7 +584,8 @@ function buildCcRequest(openaiReq) {
     body.params.temperature = temperature;
   }
   if (reasoning_effort !== undefined) {
-    body.params.reasoning_effort = reasoning_effort;
+    // CC 上游仅支持 "low"|"medium"|"high"|"xhigh"|"max"，不支持 "none"。映射 "none" -> "low"
+    body.params.reasoning_effort = reasoning_effort === 'none' ? 'low' : reasoning_effort;
   }
   if (tools && tools.length > 0) {
     body.params.tools = tools.map(t => ({
@@ -829,15 +831,24 @@ function mapCcError(ccStatus, ccBody) {
     || rawType === 'insufficient_quota';
 
   if (isQuota) {
+    // 402, not 429: OMP's transport (fetchWithRetry) treats 429/408/5xx as
+    // locally retryable and sleeps+resends with the SAME key up to 6x before
+    // ever trying a sibling credential (~150s wasted hammering a dead key
+    // for a 30s retry-after). 402 isn't in that retryable set, so it skips
+    // local retry and goes straight to auth-storage credential rotation.
+    // OMP's is402BillingCapBody() already recognizes "insufficient_quota"/
+    // "quota exceeded" wording on a 402 as a rotatable usage-limit outcome.
+    // retry-after-ms still sizes the exclusion window on the credential
+    // (30s, not OMP's 30min default) once markUsageLimitReached runs.
     return {
-      status: 429,
+      status: 402,
       body: {
         error: {
-          message,
+          message: `${message} (retry-after-ms=30000)`,
           type: 'insufficient_quota',
           code: 'insufficient_quota',
         },
-        retry_after: 0,
+        retry_after: 30,
       },
     };
   }
@@ -847,7 +858,7 @@ function mapCcError(ccStatus, ccBody) {
     return {
       status: 429,
       body: {
-        error: { message, type: 'rate_limit_error' },
+        error: { message: `${message} (retry-after-ms=30000)`, type: 'rate_limit_error' },
         retry_after: 30,
       },
     };
@@ -862,12 +873,25 @@ function mapCcEventError(event) {
   const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
-  // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
-  // 否则客户端 SDK 拿不到退避提示（402 也映射成 429，一视同仁）
+  // 与 mapCcError 保持一致：账户级余额耗尽走 402（OMP 传输层不会本地重试
+  // 429/408/5xx 之外的状态码，402 会直接冒泡到凭证轮换，而不是本地睡眠
+  // 重试同一个已耗尽的 key 最多 6 次）。
+  const isQuota = /insufficients+(?:credits|balance)|weekly usage limit|usage_limit_reached|quotas+(?:exceeded|reached)|free.?usage.?limit|go.?usage.?limit/i.test(message)
+    || ccStatus === 402;
+  if (isQuota) {
+    return {
+      status: 402,
+      body: {
+        error: { message: `${message} (retry-after-ms=30000)`, type: 'insufficient_quota', code: 'insufficient_quota' },
+        retry_after: 30,
+      },
+    };
+  }
+
   if (mapped.status === 429) {
     return {
       status: 429,
-      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+      body: { error: { message: `${message} (retry-after-ms=30000)`, type: 'rate_limit_error' }, retry_after: 30 },
     };
   }
 
@@ -971,6 +995,13 @@ function getFallbackApiKey() {
   if (CFG.apiKey) return CFG.apiKey;
   if (process.env.CC_API_KEY) return process.env.CC_API_KEY.trim();
   if (process.env.COMMAND_CODE_API_KEY) return process.env.COMMAND_CODE_API_KEY.trim();
+  try {
+    const authPath = join(homedir(), '.commandcode', 'auth.json');
+    if (existsSync(authPath)) {
+      const auth = JSON.parse(readFileSync(authPath, 'utf8'));
+      if (auth.apiKey) return auth.apiKey.trim();
+    }
+  } catch {}
   return null;
 }
 
@@ -1039,6 +1070,15 @@ async function handleChatCompletions(req, res) {
   }
 
   const apiKey = getApiKey(req.headers);
+  const authHdr = req.headers['authorization'] || req.headers['Authorization'] || '';
+  log('info', 'Chat completion request received', {
+    authHeaderPresent: !!authHdr,
+    authHeaderPrefix: authHdr.slice(0, 17),
+    resolvedKeyPrefix: apiKey ? apiKey.slice(0, 12) : 'none',
+    stream: openaiReq.stream === true,
+    model: openaiReq.model,
+  });
+
   if (!apiKey) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
@@ -1069,7 +1109,11 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
+      log('error', 'CC API error', {
+        keyPrefix: apiKey ? apiKey.slice(0, 12) : 'none',
+        status: ccResponse.status,
+        body: summarizeUpstreamError(errorText),
+      });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendJSON(res, mapped.status, mapped.body);
       return;
@@ -2254,13 +2298,7 @@ function convertResponsesToChat(respReq) {
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (!item || typeof item !== 'object') continue;
-      // OpenAI 规范里 input 数组的联合类型第一个成员是 EasyInputMessage，它的
-      // required 只有 role 与 content —— type 是可选的（官方文档与 SDK 示例普遍写作
-      // { role: 'user', content: 'hi' }）。item.type 为 undefined 但有 role 时按
-      // message 处理，否则这类 item 会落进 default 被丢弃：全部省略时只剩
-      // "input is required" 的误导性报错；混合形态时更糟 —— 校验能过，用户在
-      // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
-      switch (item.type ?? (item.role ? 'message' : undefined)) {
+      switch (item.type) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
           if (t) ensurePending().reasoning_content = t;
@@ -2296,10 +2334,7 @@ function convertResponsesToChat(respReq) {
           });
           break;
         }
-        default: {
-          log('warn', 'Unknown Responses input item type', { type: item.type });
-          break;
-        }
+        default: break;
       }
     }
   }
