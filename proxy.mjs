@@ -1169,6 +1169,11 @@ function mapCcError(ccStatus, ccBody) {
     }
   }
 
+  // Out of credits arrives as 400 BAD_REQUEST; clients only rotate keys on 429, so remap it.
+  if (/insufficient credits/i.test(message)) {
+    return { status: 429, code, body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 3600 } };
+  }
+
   // CC 429 响应可能带 retry-after
   if (ccStatus === 429) {
     return {
