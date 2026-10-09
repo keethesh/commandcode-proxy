@@ -1488,7 +1488,58 @@ function upstreamFetch(urlStr, options) {
 
 // ── 流式转发 ────────────────────────────────────────
 
+// ── 多 key 池：key 额度耗尽时换下一个 key 重试 ─────────────────
+// 客户端（OMP）只会发一个 bearer，重试时不一定换 key。key 池取自 OMP 的凭据库
+// （`/login command-code` 每个 key 一行），所以加 key 的流程不变。
+// 只有「请求自带的 bearer 本身在池里」才会启用换 key，避免任意 bearer 蹭池里的额度。
+// 额度耗尽判定：上游 400 且消息含 "insufficient credits"（上游没用 402/429）。
+const KEY_POOL_DB = process.env.CC_KEY_POOL_DB || resolve(process.env.HOME || '', '.omp/agent/agent.db');
+const KEY_POOL_PROVIDER = process.env.CC_KEY_POOL_PROVIDER || 'command-code';
+const KEY_EXHAUSTED_TTL_MS = 30 * 60 * 1000; // ponytail: fixed TTL; credits may refill earlier, we retry after 30min
+const exhaustedUntil = new Map(); // key → epoch ms
+let poolCache = { at: 0, keys: [] };
+
+function poolKeys() {
+  if (Date.now() - poolCache.at < 30000) return poolCache.keys;
+  let keys = [];
+  try {
+    const { Database } = require('bun:sqlite');
+    const db = new Database(KEY_POOL_DB, { readonly: true });
+    try {
+      keys = db.query("SELECT data FROM auth_credentials WHERE provider = ? AND credential_type = 'api_key' AND disabled_cause IS NULL ORDER BY id").all(KEY_POOL_PROVIDER)
+        .map(r => JSON.parse(r.data).key).filter(Boolean);
+    } finally { db.close(); }
+  } catch (e) {
+    if (!poolCache.warned) log('warn', 'Key pool unavailable (single-key mode)', { error: e.message });
+    poolCache.warned = true;
+  }
+  poolCache = { at: Date.now(), keys, warned: poolCache.warned };
+  return keys;
+}
+
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
+  const pool = poolKeys();
+  if (!pool.includes(apiKey)) return forwardOnce(body, apiKey, incomingHeaders, signal, promptCacheKey);
+  const now = Date.now();
+  const live = (k) => (exhaustedUntil.get(k) || 0) <= now;
+  // requested key first (if live), then other live keys; if every key is marked exhausted, just try the requested one
+  const candidates = [apiKey, ...pool.filter(k => k !== apiKey)].filter(live);
+  if (!candidates.length) candidates.push(apiKey);
+  let last;
+  for (let i = 0; i < candidates.length; i++) {
+    const key = candidates[i];
+    if (key !== apiKey) await ensureInitialized(key, signal);
+    const response = await forwardOnce(body, key, incomingHeaders, signal, promptCacheKey);
+    if (response.ok) { exhaustedUntil.delete(key); return response; }
+    last = response;
+    if (response.status !== 400 || !/insufficient credits/i.test(await response.clone().text().catch(() => ''))) return response;
+    exhaustedUntil.set(key, Date.now() + KEY_EXHAUSTED_TTL_MS);
+    log('warn', 'Key out of credits, rotating', { key: key.slice(0, 9), next: candidates[i + 1]?.slice(0, 9) ?? '(none)' });
+  }
+  return last;
+}
+
+async function forwardOnce(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey, body);
@@ -1553,6 +1604,7 @@ async function handleChatCompletions(req, res) {
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
+  log('info', 'chat request', { key: apiKey.slice(0, 9), model, stream, session: req.headers['x-session-id'] });
   const created = nowUnix();
 
   // 构建 CC 请求体
@@ -1658,7 +1710,7 @@ async function handleChatCompletions(req, res) {
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
-      log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
+      log('error', 'CC API error', { status: ccResponse.status, key: apiKey.slice(0, 9), bodyBytes: JSON.stringify(ccBody).length, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
