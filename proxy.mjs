@@ -1417,10 +1417,18 @@ function getApiKey(headers) {
 }
 
 // ── 备用 key 轮换 ─────────────────────────────────────
-// 先用调用方的 key；上游以 401/402/403（坏 key / 欠费 / 禁用）拒绝时，
-// 按 getFallbackKeyChain() 顺序换下一个 key 重发。其它状态码不是 key 问题，
-// 原样返回。要求 firstKey 非空（各 handler 在拿不到 key 时已本地 401）。
+// 401/402/403 are explicit auth/quota statuses. CommandCode also returns
+// HTTP 400 for quota exhaustion, so inspect only 400 response bodies for
+// quota markers; ordinary validation 400s must pass through unchanged.
 const KEY_ERROR_STATUSES = new Set([401, 402, 403]);
+const QUOTA_ERROR_PATTERN = /insufficient[_ ](?:credits|quota)|(?:credits|quota)[ _-]?(?:exhausted|exceeded)|usage[_ ]limit/i;
+
+async function isKeyRejection(response) {
+  if (KEY_ERROR_STATUSES.has(response.status)) return true;
+  if (response.status !== 400) return false;
+  const body = await response.clone().text().catch(() => '');
+  return QUOTA_ERROR_PATTERN.test(body);
+}
 
 async function forwardWithKeyRotation(ccBody, firstKey, incomingHeaders, signal, promptCacheKey) {
   const chain = [firstKey];
@@ -1433,7 +1441,7 @@ async function forwardWithKeyRotation(ccBody, firstKey, incomingHeaders, signal,
     key = chain[i];
     await ensureInitialized(key, signal);
     resp = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
-    if (resp.ok || !KEY_ERROR_STATUSES.has(resp.status) || i === chain.length - 1) break;
+    if (resp.ok || !(await isKeyRejection(resp)) || i === chain.length - 1) break;
     log('warn', 'Upstream rejected key, rotating to next fallback key', {
       failedKeyPrefix: key.slice(0, 12),
       nextKeyPrefix: chain[i + 1].slice(0, 12),
