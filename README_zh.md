@@ -66,6 +66,7 @@ commandcode/
 | `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
 | `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
 | `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
+| `fallbackApiKeys` | `[]` | 备用 CC key（`user_…`）列表：传入/兜底 key 被上游 401/402/403 拒绝时按序换用；第一个能用的 key 始终优先 |
 
 ### 环境变量
 

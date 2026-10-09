@@ -33,6 +33,7 @@ function loadConfig() {
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    fallbackApiKeys: [],          // 备用 CC key（user_…）：调用方 key 被上游 401/402/403 拒绝时按序换用
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -1372,18 +1373,31 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function getFallbackApiKey() {
-  if (CFG.apiKey) return CFG.apiKey;
-  if (process.env.CC_API_KEY) return process.env.CC_API_KEY.trim();
-  if (process.env.COMMAND_CODE_API_KEY) return process.env.COMMAND_CODE_API_KEY.trim();
+// 有序 fallback key 链：配置/环境变量/本机 CLI 登录，最后是 config.json 的
+// fallbackApiKeys 舰队。getFallbackApiKey() 返回第一个（保持既有调用方语义），
+// forwardWithKeyRotation() 用整条链做上游拒 key 时的轮换。
+function getFallbackKeyChain() {
+  const chain = [];
+  const push = (k) => {
+    const t = typeof k === 'string' ? k.trim() : '';
+    if (t && !chain.includes(t)) chain.push(t);
+  };
+  push(CFG.apiKey);
+  push(process.env.CC_API_KEY);
+  push(process.env.COMMAND_CODE_API_KEY);
   try {
     const authPath = join(homedir(), '.commandcode', 'auth.json');
     if (existsSync(authPath)) {
       const auth = JSON.parse(readFileSync(authPath, 'utf8'));
-      if (auth.apiKey) return auth.apiKey.trim();
+      push(auth.apiKey);
     }
   } catch {}
-  return null;
+  if (Array.isArray(CFG.fallbackApiKeys)) for (const k of CFG.fallbackApiKeys) push(k);
+  return chain;
+}
+
+function getFallbackApiKey() {
+  return getFallbackKeyChain()[0] || null;
 }
 
 function getApiKey(headers) {
@@ -1400,6 +1414,34 @@ function getApiKey(headers) {
     if (match) return match[0];
   }
   return getFallbackApiKey();
+}
+
+// ── 备用 key 轮换 ─────────────────────────────────────
+// 先用调用方的 key；上游以 401/402/403（坏 key / 欠费 / 禁用）拒绝时，
+// 按 getFallbackKeyChain() 顺序换下一个 key 重发。其它状态码不是 key 问题，
+// 原样返回。要求 firstKey 非空（各 handler 在拿不到 key 时已本地 401）。
+const KEY_ERROR_STATUSES = new Set([401, 402, 403]);
+
+async function forwardWithKeyRotation(ccBody, firstKey, incomingHeaders, signal, promptCacheKey) {
+  const chain = [firstKey];
+  for (const k of getFallbackKeyChain()) {
+    if (k && !chain.includes(k)) chain.push(k);
+  }
+  let resp = null;
+  let key = firstKey;
+  for (let i = 0; i < chain.length; i++) {
+    key = chain[i];
+    await ensureInitialized(key, signal);
+    resp = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
+    if (resp.ok || !KEY_ERROR_STATUSES.has(resp.status) || i === chain.length - 1) break;
+    log('warn', 'Upstream rejected key, rotating to next fallback key', {
+      failedKeyPrefix: key.slice(0, 12),
+      nextKeyPrefix: chain[i + 1].slice(0, 12),
+      status: resp.status,
+    });
+    await resp.text().catch(() => ''); // 排空弃用响应，避免 socket 悬挂
+  }
+  return { resp, key };
 }
 
 // ── 上游 HTTP(S) 代理（issue #18）────────────────────
@@ -1718,15 +1760,14 @@ async function handleChatCompletions(req, res) {
   reader = null; translator = null; upstreamError = null; delivered = false;
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    // 转发到 CC API（传入客户端 headers，用于提取 session ID）；fingerprint 初始化在
+    // 轮换 helper 内按候选 key 各自完成；key 被上游 401/402/403 拒绝时自动换下一个
+    const { resp: ccResponse, key: activeKey } = await forwardWithKeyRotation(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       log('error', 'CC API error', {
-        keyPrefix: apiKey ? apiKey.slice(0, 12) : 'none',
+        keyPrefix: activeKey ? activeKey.slice(0, 12) : 'none',
         status: ccResponse.status,
         body: summarizeUpstreamError(errorText),
       });
@@ -2683,9 +2724,7 @@ async function handleMessages(req, res) {
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const { resp: ccResponse } = await forwardWithKeyRotation(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -3705,8 +3744,7 @@ async function handleResponses(req, res) {
   });
 
   try {
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    const { resp: ccResponse } = await forwardWithKeyRotation(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');

@@ -65,7 +65,8 @@ commandcode/
 | `cliSessionMode` | `interactive` | `mode` inside the lifecycle metadata (**a different enum**: `interactive` / `non-interactive`) |
 | `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
 | `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
-| `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+ | `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+| `fallbackApiKeys` | `[]` | Extra CC keys (`user_…`) tried in order when the incoming/fallback key is rejected upstream with 401/402/403; a working first key always wins |
 
 ### Environment Variables
 
