@@ -1418,14 +1418,14 @@ function getApiKey(headers) {
 
 // ── 备用 key 轮换 ─────────────────────────────────────
 // 401/402/403 are explicit auth/quota statuses. CommandCode also returns
-// HTTP 400 for quota exhaustion, so inspect only 400 response bodies for
+// HTTP 400 (and 429 RATE_LIMITED for the weekly plan limit) for quota exhaustion, so inspect only 400/429 bodies for
 // quota markers; ordinary validation 400s must pass through unchanged.
 const KEY_ERROR_STATUSES = new Set([401, 402, 403]);
 const QUOTA_ERROR_PATTERN = /insufficient[_ ](?:credits|quota)|(?:credits|quota)[ _-]?(?:exhausted|exceeded)|usage[_ ]limit/i;
 
 async function isKeyRejection(response) {
   if (KEY_ERROR_STATUSES.has(response.status)) return true;
-  if (response.status !== 400) return false;
+  if (response.status !== 400 && response.status !== 429) return false; // 429 RATE_LIMITED = weekly plan limit
   const body = await response.clone().text().catch(() => '');
   return QUOTA_ERROR_PATTERN.test(body);
 }
