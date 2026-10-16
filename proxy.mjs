@@ -1492,7 +1492,7 @@ function upstreamFetch(urlStr, options) {
 // 客户端（OMP）只会发一个 bearer，重试时不一定换 key。key 池取自 OMP 的凭据库
 // （`/login command-code` 每个 key 一行），所以加 key 的流程不变。
 // 只有「请求自带的 bearer 本身在池里」才会启用换 key，避免任意 bearer 蹭池里的额度。
-// 额度耗尽判定：上游 400 且消息含 "insufficient credits"（上游没用 402/429）。
+// 额度耗尽判定：上游 400 且消息含 "insufficient credits"，或 429 RATE_LIMITED 且消息含 "weekly usage limit"。
 const KEY_POOL_DB = process.env.CC_KEY_POOL_DB || resolve(process.env.HOME || '', '.omp/agent/agent.db');
 const KEY_POOL_PROVIDER = process.env.CC_KEY_POOL_PROVIDER || 'command-code';
 const KEY_EXHAUSTED_TTL_MS = 30 * 60 * 1000; // ponytail: fixed TTL; credits may refill earlier, we retry after 30min
@@ -1532,7 +1532,9 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     const response = await forwardOnce(body, key, incomingHeaders, signal, promptCacheKey);
     if (response.ok) { exhaustedUntil.delete(key); return response; }
     last = response;
-    if (response.status !== 400 || !/insufficient credits/i.test(await response.clone().text().catch(() => ''))) return response;
+    const exhausted = (response.status === 400 || response.status === 429)
+      && /insufficient credits|weekly usage limit/i.test(await response.clone().text().catch(() => ''));
+    if (!exhausted) return response;
     exhaustedUntil.set(key, Date.now() + KEY_EXHAUSTED_TTL_MS);
     log('warn', 'Key out of credits, rotating', { key: key.slice(0, 9), next: candidates[i + 1]?.slice(0, 9) ?? '(none)' });
   }
