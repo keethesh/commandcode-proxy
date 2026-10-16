@@ -66,6 +66,7 @@ commandcode/
 | `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
 | `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
 | `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
+| `fallbackApiKeys` | `[]` | 备用 CC key（`user_…`）列表：传入/兜底 key 被上游 401/402/403 拒绝时按序换用；第一个能用的 key 始终优先 |
 
 ### 环境变量
 
@@ -93,6 +94,7 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数就断开该客户端，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | 后端 keep-alive 时长（`headersTimeout` 自动 +1s）。**必须大于反代侧的 keepalive_timeout**，见 [keep-alive 时序](#nginx-反代建议) |
+| `CC_API_KEY` | 空 | 请求未携带 key 时的 `apiKey` 兜底（亦支持 `COMMAND_CODE_API_KEY`）|
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该

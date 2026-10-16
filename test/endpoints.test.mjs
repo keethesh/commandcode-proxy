@@ -2,6 +2,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setup } from './helpers.mjs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 test('POST /v1/chat/completions 流式：返回 OpenAI SSE 且内容正确', async () => {
   const s = await setup();
@@ -93,11 +96,14 @@ test('未知路由返回 404', async () => {
   } finally { await s.close(); }
 });
 
-test('缺少 API key 返回 401', async () => {
-  const s = await setup();
+test('缺少 API key 且无任何 fallback key 时返回 401', async () => {
+  // 隔离：fallback 链会读 config.json、CC_API_KEY 与 ~/.commandcode/auth.json，宿主机上有就不会 401
+  const dir = mkdtempSync(join(tmpdir(), 'ccp-nokey-'));
+  writeFileSync(join(dir, 'config.json'), '{}');
+  const s = await setup({ cwd: dir, env: { HOME: dir, CC_API_KEY: '', COMMAND_CODE_API_KEY: '' } });
   try {
     const r = await s.proxy.post('/v1/chat/completions',
       { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(r.status, 401);
-  } finally { await s.close(); }
+  } finally { await s.close(); rmSync(dir, { recursive: true, force: true }); }
 });

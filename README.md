@@ -65,7 +65,8 @@ commandcode/
 | `cliSessionMode` | `interactive` | `mode` inside the lifecycle metadata (**a different enum**: `interactive` / `non-interactive`) |
 | `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
 | `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
-| `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+ | `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+| `fallbackApiKeys` | `[]` | Extra CC keys (`user_…`) tried in order when the incoming/fallback key is rejected upstream: 401/402/403, or 400/429 whose body says insufficient credits / usage limit (e.g. the weekly plan limit). A rejected key is skipped for 30 min. Under bun, the `command-code` keys in `~/.omp/agent/agent.db` (`CC_KEY_POOL_DB`) are appended to the chain automatically |
 
 ### Environment Variables
 
@@ -93,6 +94,7 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | unset (disabled) | Drop the client once downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | Backend keep-alive timeout (`headersTimeout` is set to +1s automatically). **Must be larger than the reverse proxy's keepalive_timeout** — see [keep-alive ordering](#suggested-nginx-front) |
+| `CC_API_KEY` | *(unset)* | `apiKey` fallback used when a request carries no key (also accepts `COMMAND_CODE_API_KEY`) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header

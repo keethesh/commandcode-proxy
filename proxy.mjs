@@ -9,7 +9,8 @@ import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
-import { resolve, dirname } from 'path';
+import { resolve, dirname, join } from 'path';
+import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
 // ── 配置加载 ──────────────────────────────────────
@@ -32,6 +33,7 @@ function loadConfig() {
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    fallbackApiKeys: [],          // 备用 CC key（user_…）：调用方 key 被上游 401/402/403 拒绝时按序换用
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -57,6 +59,9 @@ function loadConfig() {
   if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
+  if (process.env.CC_API_KEY || process.env.COMMAND_CODE_API_KEY) {
+    defaults.apiKey = (process.env.CC_API_KEY || process.env.COMMAND_CODE_API_KEY).trim();
+  }
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
 
   return defaults;
@@ -783,7 +788,7 @@ function buildCcRequest(openaiReq) {
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
-      max_tokens: Math.min(max_tokens || 64000, 200000),
+      max_tokens: max_tokens ? Math.min(Math.max(max_tokens + 2048, 4096), 200000) : 64000,
       stream: true,  // CC API 总是 stream
     },
   };
@@ -804,7 +809,8 @@ function buildCcRequest(openaiReq) {
     body.params.temperature = temperature;
   }
   if (reasoning_effort !== undefined) {
-    body.params.reasoning_effort = reasoning_effort;
+    // CC 上游仅支持 "low"|"medium"|"high"|"xhigh"|"max"，不支持 "none"。映射 "none" -> "low"
+    body.params.reasoning_effort = reasoning_effort === 'none' ? 'low' : reasoning_effort;
   }
   // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
   // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段；
@@ -1155,12 +1161,16 @@ const CC_STATUS_MAP = {
 function mapCcError(ccStatus, ccBody) {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
   let message = `CC API error (${ccStatus})`;
+  let rawType = null;
+  let rawCode = null;
   let code = null;
 
   if (ccBody) {
     try {
       const parsed = JSON.parse(ccBody);
       message = parsed.error?.message || parsed.message || message;
+      rawType = parsed.error?.type || parsed.type || null;
+      rawCode = parsed.error?.code || parsed.code || null;
       // 上游错误体：{"success":false,"error":{"code":"BAD_REQUEST"|"USAGE_EXCEEDED",...}}
       // code 是上游的机器可读错误分类（BAD_REQUEST / USAGE_EXCEEDED 等），透出来便于下游 SDK 与运维判定
       code = parsed.error?.code || parsed.code || null;
@@ -1169,9 +1179,32 @@ function mapCcError(ccStatus, ccBody) {
     }
   }
 
-  // Out of credits arrives as 400 BAD_REQUEST; clients only rotate keys on 429, so remap it.
-  if (/insufficient credits/i.test(message)) {
-    return { status: 429, code, body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 3600 } };
+  // Quota / balance / rate limits -> HTTP 429 insufficient_quota for OMP credential rotation
+  const isQuota = /insufficient\s+(?:credits|balance)|weekly usage limit|usage_limit_reached|quota\s+(?:exceeded|reached)|free.?usage.?limit|go.?usage.?limit/i.test(message)
+    || rawCode === 'insufficient_quota'
+    || rawType === 'insufficient_quota';
+
+  if (isQuota) {
+    // 402, not 429: OMP's transport (fetchWithRetry) treats 429/408/5xx as
+    // locally retryable and sleeps+resends with the SAME key up to 6x before
+    // ever trying a sibling credential (~150s wasted hammering a dead key
+    // for a 30s retry-after). 402 isn't in that retryable set, so it skips
+    // local retry and goes straight to auth-storage credential rotation.
+    // OMP's is402BillingCapBody() already recognizes "insufficient_quota"/
+    // "quota exceeded" wording on a 402 as a rotatable usage-limit outcome.
+    // retry-after-ms still sizes the exclusion window on the credential
+    // (30s, not OMP's 30min default) once markUsageLimitReached runs.
+    return {
+      status: 402,
+      body: {
+        error: {
+          message: `${message} (retry-after-ms=30000)`,
+          type: 'insufficient_quota',
+          code: 'insufficient_quota',
+        },
+        retry_after: 30,
+      },
+    };
   }
 
   // CC 429 响应可能带 retry-after
@@ -1180,7 +1213,7 @@ function mapCcError(ccStatus, ccBody) {
       status: 429,
       code,
       body: {
-        error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) },
+        error: { message: `${message} (retry-after-ms=30000)`, type: 'rate_limit_error', ...(code ? { code } : {}) },
         retry_after: 30,
       },
     };
@@ -1205,14 +1238,27 @@ function mapCcEventError(event) {
   const ccStatus = reportedStatus ?? 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
-  // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
-  // 否则客户端 SDK 拿不到退避提示（402 也映射成 429，一视同仁）
+  // 与 mapCcError 保持一致：账户级余额耗尽走 402（OMP 传输层不会本地重试
+  // 429/408/5xx 之外的状态码，402 会直接冒泡到凭证轮换，而不是本地睡眠
+  // 重试同一个已耗尽的 key 最多 6 次）。
+  const isQuota = /insufficients+(?:credits|balance)|weekly usage limit|usage_limit_reached|quotas+(?:exceeded|reached)|free.?usage.?limit|go.?usage.?limit/i.test(message)
+    || ccStatus === 402;
+  if (isQuota) {
+    return {
+      status: 402,
+      body: {
+        error: { message: `${message} (retry-after-ms=30000)`, type: 'insufficient_quota', code: 'insufficient_quota' },
+        retry_after: 30,
+      },
+    };
+  }
+
   if (mapped.status === 429) {
     return {
       status: 429,
       code,
       reportedStatus,
-      body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
+      body: { error: { message: `${message} (retry-after-ms=30000)`, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
     };
   }
 
@@ -1327,6 +1373,33 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+// 有序 fallback key 链：配置/环境变量/本机 CLI 登录，最后是 config.json 的
+// fallbackApiKeys 舰队。getFallbackApiKey() 返回第一个（保持既有调用方语义），
+// forwardWithKeyRotation() 用整条链做上游拒 key 时的轮换。
+function getFallbackKeyChain() {
+  const chain = [];
+  const push = (k) => {
+    const t = typeof k === 'string' ? k.trim() : '';
+    if (t && !chain.includes(t)) chain.push(t);
+  };
+  push(CFG.apiKey);
+  push(process.env.CC_API_KEY);
+  push(process.env.COMMAND_CODE_API_KEY);
+  try {
+    const authPath = join(homedir(), '.commandcode', 'auth.json');
+    if (existsSync(authPath)) {
+      const auth = JSON.parse(readFileSync(authPath, 'utf8'));
+      push(auth.apiKey);
+    }
+  } catch {}
+  if (Array.isArray(CFG.fallbackApiKeys)) for (const k of CFG.fallbackApiKeys) push(k);
+  return chain;
+}
+
+function getFallbackApiKey() {
+  return getFallbackKeyChain()[0] || null;
+}
+
 function getApiKey(headers) {
   // Try Authorization: Bearer header (OpenAI SDK style)
   const auth = headers['authorization'] || headers['Authorization'] || '';
@@ -1340,7 +1413,51 @@ function getApiKey(headers) {
     const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
     if (match) return match[0];
   }
-  return null;
+  return getFallbackApiKey();
+}
+
+// ── 备用 key 轮换 ─────────────────────────────────────
+// 401/402/403 are explicit auth/quota statuses. CommandCode also returns
+// HTTP 400 (and 429 RATE_LIMITED for the weekly plan limit) for quota exhaustion, so inspect only 400/429 bodies for
+// quota markers; ordinary validation 400s must pass through unchanged.
+const KEY_ERROR_STATUSES = new Set([401, 402, 403]);
+const QUOTA_ERROR_PATTERN = /insufficient[_ ](?:credits|quota)|(?:credits|quota)[ _-]?(?:exhausted|exceeded)|usage[_ ]limit/i;
+
+async function isKeyRejection(response) {
+  if (KEY_ERROR_STATUSES.has(response.status)) return true;
+  if (response.status !== 400 && response.status !== 429) return false; // 429 RATE_LIMITED = weekly plan limit
+  const body = await response.clone().text().catch(() => '');
+  return QUOTA_ERROR_PATTERN.test(body);
+}
+
+async function forwardWithKeyRotation(ccBody, firstKey, incomingHeaders, signal, promptCacheKey) {
+  // requested key, then config fallbackApiKeys, then the OMP credential DB pool (bun only)
+  const all = [firstKey];
+  for (const k of [...getFallbackKeyChain(), ...poolKeys()]) {
+    if (k && !all.includes(k)) all.push(k);
+  }
+  // skip keys recently rejected for quota; if every key is marked dead, just try the requested one
+  const now = Date.now();
+  const live = all.filter(k => (exhaustedUntil.get(k) || 0) <= now);
+  const chain = live.length ? live : [firstKey];
+  let resp = null;
+  let key = firstKey;
+  for (let i = 0; i < chain.length; i++) {
+    key = chain[i];
+    await ensureInitialized(key, signal);
+    resp = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
+    if (resp.ok) { exhaustedUntil.delete(key); break; }
+    if (!(await isKeyRejection(resp))) break;
+    exhaustedUntil.set(key, Date.now() + KEY_EXHAUSTED_TTL_MS);
+    if (i === chain.length - 1) break;
+    log('warn', 'Upstream rejected key, rotating to next fallback key', {
+      failedKeyPrefix: key.slice(0, 12),
+      nextKeyPrefix: chain[i + 1].slice(0, 12),
+      status: resp.status,
+    });
+    await resp.text().catch(() => ''); // 排空弃用响应，避免 socket 悬挂
+  }
+  return { resp, key };
 }
 
 // ── 上游 HTTP(S) 代理（issue #18）────────────────────
@@ -1488,11 +1605,10 @@ function upstreamFetch(urlStr, options) {
 
 // ── 流式转发 ────────────────────────────────────────
 
-// ── 多 key 池：key 额度耗尽时换下一个 key 重试 ─────────────────
-// 客户端（OMP）只会发一个 bearer，重试时不一定换 key。key 池取自 OMP 的凭据库
-// （`/login command-code` 每个 key 一行），所以加 key 的流程不变。
-// 只有「请求自带的 bearer 本身在池里」才会启用换 key，避免任意 bearer 蹭池里的额度。
-// 额度耗尽判定：上游 400 且消息含 "insufficient credits"，或 429 RATE_LIMITED 且消息含 "weekly usage limit"。
+// ── 多 key 池：OMP 凭据库里的 key 并入轮换链 ─────────────────
+// 客户端（OMP）只会发一个 bearer。key 池取自 OMP 的凭据库（`/login command-code` 每个 key 一行），
+// 所以加 key 的流程不变。仅 bun 下可用（bun:sqlite）；node 下静默跳过，只用 config.json 的 fallbackApiKeys。
+// 额度耗尽的 key 在 KEY_EXHAUSTED_TTL_MS 内不再尝试，避免每个请求都先撞一遍已耗尽的 key。
 const KEY_POOL_DB = process.env.CC_KEY_POOL_DB || resolve(process.env.HOME || '', '.omp/agent/agent.db');
 const KEY_POOL_PROVIDER = process.env.CC_KEY_POOL_PROVIDER || 'command-code';
 const KEY_EXHAUSTED_TTL_MS = 30 * 60 * 1000; // ponytail: fixed TTL; credits may refill earlier, we retry after 30min
@@ -1500,6 +1616,7 @@ const exhaustedUntil = new Map(); // key → epoch ms
 let poolCache = { at: 0, keys: [] };
 
 function poolKeys() {
+  if (!process.versions.bun) return [];
   if (Date.now() - poolCache.at < 30000) return poolCache.keys;
   let keys = [];
   try {
@@ -1518,30 +1635,6 @@ function poolKeys() {
 }
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
-  const pool = poolKeys();
-  if (!pool.includes(apiKey)) return forwardOnce(body, apiKey, incomingHeaders, signal, promptCacheKey);
-  const now = Date.now();
-  const live = (k) => (exhaustedUntil.get(k) || 0) <= now;
-  // requested key first (if live), then other live keys; if every key is marked exhausted, just try the requested one
-  const candidates = [apiKey, ...pool.filter(k => k !== apiKey)].filter(live);
-  if (!candidates.length) candidates.push(apiKey);
-  let last;
-  for (let i = 0; i < candidates.length; i++) {
-    const key = candidates[i];
-    if (key !== apiKey) await ensureInitialized(key, signal);
-    const response = await forwardOnce(body, key, incomingHeaders, signal, promptCacheKey);
-    if (response.ok) { exhaustedUntil.delete(key); return response; }
-    last = response;
-    const exhausted = (response.status === 400 || response.status === 429)
-      && /insufficient credits|weekly usage limit/i.test(await response.clone().text().catch(() => ''));
-    if (!exhausted) return response;
-    exhaustedUntil.set(key, Date.now() + KEY_EXHAUSTED_TTL_MS);
-    log('warn', 'Key out of credits, rotating', { key: key.slice(0, 9), next: candidates[i + 1]?.slice(0, 9) ?? '(none)' });
-  }
-  return last;
-}
-
-async function forwardOnce(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey, body);
@@ -1598,6 +1691,15 @@ async function handleChatCompletions(req, res) {
   }
 
   const apiKey = getApiKey(req.headers);
+  const authHdr = req.headers['authorization'] || req.headers['Authorization'] || '';
+  log('info', 'Chat completion request received', {
+    authHeaderPresent: !!authHdr,
+    authHeaderPrefix: authHdr.slice(0, 17),
+    resolvedKeyPrefix: apiKey ? apiKey.slice(0, 12) : 'none',
+    stream: openaiReq.stream === true,
+    model: openaiReq.model,
+  });
+
   if (!apiKey) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
@@ -1704,13 +1806,17 @@ async function handleChatCompletions(req, res) {
   reader = null; translator = null; upstreamError = null; delivered = false;
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    // 转发到 CC API（传入客户端 headers，用于提取 session ID）；fingerprint 初始化在
+    // 轮换 helper 内按候选 key 各自完成；key 被上游 401/402/403 拒绝时自动换下一个
+    const { resp: ccResponse, key: activeKey } = await forwardWithKeyRotation(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
+      log('error', 'CC API error', {
+        keyPrefix: activeKey ? activeKey.slice(0, 12) : 'none',
+        status: ccResponse.status,
+        body: summarizeUpstreamError(errorText),
+      });
       const mapped = mapCcError(ccResponse.status, errorText);
       log('error', 'CC API error', { status: ccResponse.status, key: apiKey.slice(0, 9), bodyBytes: JSON.stringify(ccBody).length, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendJSON(res, mapped.status, mapped.body);
@@ -2664,9 +2770,7 @@ async function handleMessages(req, res) {
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const { resp: ccResponse } = await forwardWithKeyRotation(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -2991,12 +3095,14 @@ async function fetchModels(apiKey) {
     return dynamicModels;
   }
 
+  const resolvedKey = apiKey || getFallbackApiKey();
+
   try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+    if (!resolvedKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
     const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        'Authorization': `Bearer ${resolvedKey}`,
         'x-cli-environment': 'production',
         'x-command-code-version': CC_VERSION,
       },
@@ -3008,20 +3114,21 @@ async function fetchModels(apiKey) {
       if (Array.isArray(data.data)) {
         dynamicModels = data.data.map(m => ({
           id: m.id,
-          name: m.id,
+          name: m.name || m.id,
+          context_length: m.context_length || 1000000,
         }));
         modelsLastFetch = now;
         log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
         return dynamicModels;
       }
     }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
+    log('warn', 'Provider models fetch failed, using fallback list', { status: response.status });
   } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
+    log('warn', 'Provider models fetch error, using fallback list', { error: e.message });
   }
 
-  // Fallback to hardcoded MODELS
-  return MODELS;
+  // Fallback to cached dynamicModels or hardcoded MODELS
+  return dynamicModels || MODELS;
 }
 
 // ── OpenAI Responses API（/v1/responses）──────────────
@@ -3267,10 +3374,7 @@ function convertResponsesToChat(respReq) {
           }
           break;
         }
-        default: {
-          log('warn', 'Unknown Responses input item type', { type: item.type });
-          break;
-        }
+        default: break;
       }
     }
   }
@@ -3686,8 +3790,7 @@ async function handleResponses(req, res) {
   });
 
   try {
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    const { resp: ccResponse } = await forwardWithKeyRotation(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -3965,9 +4068,12 @@ async function handleModels(req, res) {
     object: 'list',
     data: models.map(m => ({
       id: m.id,
+      name: m.name || m.id,
       object: 'model',
       created: now,
       owned_by: 'command-code',
+      context_length: m.context_length || 1000000,
+      max_model_len: m.context_length || 1000000,
     })),
   });
 }
@@ -4051,6 +4157,14 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
+server.on('error', (err) => {
+  if (err?.code === 'EADDRINUSE') {
+    log('info', `Port ${CFG.port} is already active (EADDRINUSE), exiting cleanly.`);
+    process.exit(0);
+  }
+  log('error', 'Server error', { message: err?.message || String(err) });
+  process.exit(1);
+});
 // ── keep-alive 时序（放在反向代理后面时是必调项） ──────────────
 // 反代（nginx/OpenResty）的 upstream keepalive_timeout 必须**小于**这里的值，
 // 否则反代会复用一条后端已经关掉的连接：它把请求体写过去，后端早已 FIN，

@@ -2,6 +2,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setup } from './helpers.mjs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const AUTH = { Authorization: 'Bearer user_test' };
 const CHAT = { model: 'm', stream: true, messages: [{ role: 'user', content: 'hi' }] };
@@ -28,11 +31,11 @@ for (const [upstream, expected] of MAPPING) {
   });
 }
 
-test('上游 402（payment required）映射为 429 而非 402', async () => {
+test('上游 402（payment required）映射为 402 insufficient_quota，让 OMP 直接轮换凭证', async () => {
   const s = await setup({ status: 402, errorBody: JSON.stringify({ error: { message: 'insufficient credits' } }) });
   try {
     const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
-    assert.equal(r.status, 429, '402 是 CC 的余额语义，下游按限流处理');
+    assert.equal(r.status, 402, '402 不在 OMP 本地重试集合内，会直接触发凭证轮换');
     const j = await r.json();
     assert.match(j.error.message, /insufficient credits/, '上游错误体应透传进 message');
   } finally { await s.close(); }
@@ -165,6 +168,55 @@ test('413 报错包含实际请求体积（客户端要知道超了多少）', a
       if (!sawLog) await new Promise(r => setTimeout(r, 50));
     }
     assert.ok(sawLog, '应有一条可 grep 的 warn 日志，便于运维统计实际体积分布');
+  } finally { await s.close(); }
+});
+
+// 用量耗尽的 key 自动换下一个 fallback key：CC 周限额是 HTTP 429 RATE_LIMITED（不是 400/402）
+const WEEKLY = JSON.stringify({ success: false, error: { code: 'RATE_LIMITED', status: 429,
+  message: "You've reached your weekly usage limit for your plan." } });
+
+async function rotationSetup(exhaustedStatus, exhaustedBody) {
+  const cwd = mkdtempSync(join(tmpdir(), 'ccp-rot-'));
+  writeFileSync(join(cwd, 'config.json'), JSON.stringify({ fallbackApiKeys: ['user_good'] }));
+  const s = await setup({ cwd, env: { HOME: cwd, CC_API_KEY: '', COMMAND_CODE_API_KEY: '' }, onRequest: (req, res) => {
+    if (req.url !== '/alpha/generate' || !(req.headers.authorization || '').includes('user_dead')) return false;
+    res.writeHead(exhaustedStatus, { 'Content-Type': 'application/json' });
+    res.end(exhaustedBody);
+    return true;
+  } });
+  const close = s.close;
+  s.close = async () => { await close(); rmSync(cwd, { recursive: true, force: true }); };
+  return s;
+}
+
+for (const [status, body, label] of [[429, WEEKLY, '429 weekly usage limit'],
+  [400, JSON.stringify({ error: { message: 'insufficient credits' } }), '400 insufficient credits']]) {
+  test('额度耗尽（' + label + '）时轮换到 fallback key 并成功', async () => {
+    const s = await rotationSetup(status, body);
+    try {
+      const r = await s.proxy.post('/v1/chat/completions', { ...CHAT, stream: false }, { Authorization: 'Bearer user_dead' });
+      assert.equal(r.status, 200, await r.clone().text());
+      assert.equal(s.mock.generateCount(), 2, '先撞耗尽的 key，再换 fallback key');
+    } finally { await s.close(); }
+  });
+}
+
+test('普通 429 限流（非额度）不轮换 key', async () => {
+  const s = await rotationSetup(429, JSON.stringify({ error: { message: 'slow down' } }));
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', { ...CHAT, stream: false }, { Authorization: 'Bearer user_dead' });
+    assert.equal(r.status, 429);
+    assert.equal(s.mock.generateCount(), 1);
+  } finally { await s.close(); }
+});
+
+test('耗尽的 key 在 TTL 内被跳过，不会每个请求都先撞一遍', async () => {
+  const s = await rotationSetup(429, WEEKLY);
+  try {
+    const body = { ...CHAT, stream: false };
+    await s.proxy.post('/v1/chat/completions', body, { Authorization: 'Bearer user_dead' });
+    await s.proxy.post('/v1/chat/completions', body, { Authorization: 'Bearer user_dead' });
+    assert.equal(s.mock.generateCount(), 3, '第 1 次 2 跳，第 2 次直接用 fallback（1 跳）');
   } finally { await s.close(); }
 });
 
