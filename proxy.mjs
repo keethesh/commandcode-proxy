@@ -1436,9 +1436,10 @@ async function forwardWithKeyRotation(ccBody, firstKey, incomingHeaders, signal,
   for (const k of [...getFallbackKeyChain(), ...poolKeys()]) {
     if (k && !all.includes(k)) all.push(k);
   }
+  refreshQuota(all);
   // skip keys recently rejected for quota; if every key is marked dead, just try the requested one
   const now = Date.now();
-  const live = all.filter(k => (exhaustedUntil.get(k) || 0) <= now);
+  const live = orderByQuota(all.filter(k => (exhaustedUntil.get(k) || 0) <= now));
   const chain = live.length ? live : [firstKey];
   let resp = null;
   let key = firstKey;
@@ -1632,6 +1633,53 @@ function poolKeys() {
   }
   poolCache = { at: Date.now(), keys, warned: poolCache.warned };
   return keys;
+}
+
+// ── 用量感知选 key：最先过期的额度先用（EDF）──────────────
+// 订阅额度账期末清零不结转，购买额度永不过期；5h/周窗口只限速、不清零余额。
+// 所以最省 = 在当前可用（窗口没超、还有余额）的账号里，先烧账期最早结束的那个；
+// 只剩购买额度的排最后。同一账号会一直排第一直到用完，prompt cache 不会来回跳。
+// 额度信息后台刷新（不阻塞请求）；未知的 key 保持原顺序，排在可用之后、不可用之前。
+const QUOTA_TTL_MS = 60_000;
+const quota = new Map(); // key → { usable, expiresAt }
+let quotaAt = 0;
+let quotaRefreshing = null;
+let lastTopKey = null;
+
+async function fetchQuota(key) {
+  const get = (p) => upstreamFetch(`${CFG.apiBase}${p}`, {
+    headers: { Authorization: `Bearer ${key}`, 'User-Agent': 'cli', 'x-command-code-version': CC_VERSION },
+    signal: AbortSignal.timeout(10000),
+  }).then(r => r.ok ? r.json() : null);
+  const [c, s] = await Promise.all([get('/alpha/billing/credits'), get('/alpha/billing/subscriptions')]);
+  if (!c?.credits) return null;
+  const w = c.windowLimits || {};
+  const over = (x) => x && (x.exceeded || x.used >= x.cap);
+  const capped = w.limited && (w.exceeded || over(w.fiveHour) || over(w.weekly));
+  const plan = (c.credits.monthlyCredits || 0) + (c.credits.freeCredits || 0);
+  const periodEnd = Date.parse(s?.data?.currentPeriodEnd) || Infinity;
+  if (plan > 0 && !capped) return { usable: true, expiresAt: periodEnd };
+  return { usable: (c.credits.purchasedCredits || 0) > 0, expiresAt: Infinity };
+}
+
+function refreshQuota(keys) {
+  if (quotaRefreshing || Date.now() - quotaAt < QUOTA_TTL_MS) return;
+  quotaRefreshing = Promise.all(keys.map(async (k) => {
+    const q = await fetchQuota(k).catch(() => null);
+    if (q) quota.set(k, q); else quota.delete(k);
+  })).finally(() => { quotaAt = Date.now(); quotaRefreshing = null; });
+}
+
+function orderByQuota(keys) {
+  const rank = (k) => { const q = quota.get(k); return q ? (q.usable ? 0 : 2) : 1; };
+  const sorted = [...keys].sort((a, b) =>
+    rank(a) - rank(b) || (rank(a) === 0 ? quota.get(a).expiresAt - quota.get(b).expiresAt : 0) || 0);
+  if (sorted[0] && sorted[0] !== lastTopKey) {
+    lastTopKey = sorted[0];
+    const q = quota.get(sorted[0]);
+    log('info', 'Preferred key', { keyPrefix: sorted[0].slice(0, 12), expiresAt: q && Number.isFinite(q.expiresAt) ? new Date(q.expiresAt).toISOString() : null });
+  }
+  return sorted;
 }
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {

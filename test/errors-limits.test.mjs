@@ -220,3 +220,25 @@ test('耗尽的 key 在 TTL 内被跳过，不会每个请求都先撞一遍', a
   } finally { await s.close(); }
 });
 
+test('优先用账期最早结束的可用 key；窗口超限的 key 排后', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ccp-edf-'));
+  writeFileSync(join(cwd, 'config.json'), JSON.stringify({ fallbackApiKeys: ['user_late', 'user_capped', 'user_soon'] }));
+  const end = { user_late: '2099-01-01T00:00:00Z', user_capped: '2000-01-01T00:00:00Z', user_soon: '2098-01-01T00:00:00Z' };
+  const s = await setup({ cwd, env: { HOME: cwd, CC_API_KEY: '', COMMAND_CODE_API_KEY: '' }, onRequest: (req, res) => {
+    const key = (req.headers.authorization || '').slice(7);
+    const json = (o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); return true; };
+    if (req.url === '/alpha/billing/subscriptions') return json({ data: { currentPeriodEnd: end[key] } });
+    if (req.url === '/alpha/billing/credits') return json({ credits: { monthlyCredits: 5 }, windowLimits: { limited: true,
+      fiveHour: { used: key === 'user_capped' ? 3 : 0, cap: 3 }, weekly: { used: 0, cap: 6 } } });
+    return false;
+  } });
+  try {
+    const body = { ...CHAT, stream: false };
+    await s.proxy.post('/v1/chat/completions', body, { Authorization: 'Bearer user_late' });
+    for (let i = 0; i < 50 && s.mock.seen.filter(x => x.url === '/alpha/billing/subscriptions').length < 3; i++) await new Promise(r => setTimeout(r, 20));
+    await new Promise(r => setTimeout(r, 50));
+    await s.proxy.post('/v1/chat/completions', body, { Authorization: 'Bearer user_late' });
+    assert.equal(s.mock.lastGenerate().headers.authorization, 'Bearer user_soon');
+  } finally { await s.close(); rmSync(cwd, { recursive: true, force: true }); }
+});
+
